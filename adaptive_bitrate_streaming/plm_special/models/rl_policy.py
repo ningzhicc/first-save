@@ -34,6 +34,7 @@ class OfflineRLPolicy(nn.Module):
 
         self.bitrate_levels = bitrate_levels
         self.max_length = max_length
+        self.state_encoder_mode = getattr(state_encoder, 'output_mode', 'legacy')
 
         self.plm = plm
         self.plm_embed_size = plm_embed_size
@@ -44,12 +45,16 @@ class OfflineRLPolicy(nn.Module):
         self.embed_timestep = nn.Embedding(max_ep_len + 1, plm_embed_size).to(device)
         self.embed_return = nn.Linear(1, plm_embed_size).to(device)
         self.embed_action = nn.Linear(1, plm_embed_size).to(device)
-        self.embed_state1 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
-        self.embed_state2 = nn.Linear(state_feature_dim, plm_embed_size).to(device)    
-        self.embed_state3 = nn.Linear(state_feature_dim * (6 - conv_size + 1), plm_embed_size).to(device)    
-        self.embed_state4 = nn.Linear(state_feature_dim * (6 - conv_size + 1), plm_embed_size).to(device)    
-        self.embed_state5 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
-        self.embed_state6 = nn.Linear(state_feature_dim, plm_embed_size).to(device)    
+        if self.state_encoder_mode == 'legacy':
+            self.embed_state1 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
+            self.embed_state2 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
+            self.embed_state3 = nn.Linear(state_feature_dim * (6 - conv_size + 1), plm_embed_size).to(device)
+            self.embed_state4 = nn.Linear(state_feature_dim * (6 - conv_size + 1), plm_embed_size).to(device)
+            self.embed_state5 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
+            self.embed_state6 = nn.Linear(state_feature_dim, plm_embed_size).to(device)
+            self.state_token_count = 6
+        else:
+            self.state_token_count = state_encoder.num_state_tokens
 
         self.embed_ln = nn.LayerNorm(plm_embed_size).to(device)
         # =========== multimodal encoder (end) ===========
@@ -66,11 +71,40 @@ class OfflineRLPolicy(nn.Module):
 
         self.residual = residual
         self.which_layer = which_layer
-        self.modules_except_plm = nn.ModuleList([  # used to save and load modules except plm
-            self.state_encoder, self.embed_timestep, self.embed_return, self.embed_action, self.embed_ln, 
-            self.embed_state1, self.embed_state2, self.embed_state3, self.embed_state4, self.embed_state5,
-            self.embed_state6, self.action_head
-        ])
+        modules_except_plm = [
+            self.state_encoder, self.embed_timestep, self.embed_return, self.embed_action, self.embed_ln, self.action_head
+        ]
+        if self.state_encoder_mode == 'legacy':
+            modules_except_plm.extend([
+                self.embed_state1, self.embed_state2, self.embed_state3,
+                self.embed_state4, self.embed_state5, self.embed_state6
+            ])
+        self.modules_except_plm = nn.ModuleList(modules_except_plm)
+
+    def _truncate_token_sequence(self, stacked_inputs):
+        # The dataset and deques already control the context window by decision steps.
+        # Truncating by raw token count can cut a state-action block in half.
+        return stacked_inputs
+
+    def _encode_states(self, states, time_embeddings):
+        states_features = self.state_encoder(states)
+        if self.state_encoder_mode == 'legacy':
+            states_embeddings1 = self.embed_state1(states_features[0]) + time_embeddings
+            states_embeddings2 = self.embed_state2(states_features[1]) + time_embeddings
+            states_embeddings3 = self.embed_state3(states_features[2]) + time_embeddings
+            states_embeddings4 = self.embed_state4(states_features[3]) + time_embeddings
+            states_embeddings5 = self.embed_state5(states_features[4]) + time_embeddings
+            states_embeddings6 = self.embed_state6(states_features[5]) + time_embeddings
+            return torch.stack([
+                states_embeddings1,
+                states_embeddings2,
+                states_embeddings3,
+                states_embeddings4,
+                states_embeddings5,
+                states_embeddings6,
+            ], dim=2)
+
+        return states_features + time_embeddings.unsqueeze(2)
 
     def forward(self, states, actions, returns, timesteps, attention_mask=None):
         """
@@ -94,13 +128,7 @@ class OfflineRLPolicy(nn.Module):
 
         # Step 2: process states, turn them into embeddings.
         states = states.to(self.device)  # shape: (1, seq_len, 6, 6)
-        states_features = self.state_encoder(states)
-        states_embeddings1 = self.embed_state1(states_features[0]) + time_embeddings
-        states_embeddings2 = self.embed_state2(states_features[1]) + time_embeddings
-        states_embeddings3 = self.embed_state3(states_features[2]) + time_embeddings
-        states_embeddings4 = self.embed_state4(states_features[3]) + time_embeddings
-        states_embeddings5 = self.embed_state5(states_features[4]) + time_embeddings
-        states_embeddings6 = self.embed_state6(states_features[5]) + time_embeddings
+        states_embeddings = self._encode_states(states, time_embeddings)
         
         # Step 3: stack returns, states, actions embeddings.
         # this makes the sequence look like (R_1, s_1-1, s_1-2, ..., s_1-n, a_1, R_2, s_2-1, ..., s_2-m, a_2, ...)
@@ -108,13 +136,12 @@ class OfflineRLPolicy(nn.Module):
         stacked_inputs = []
         action_embed_positions = np.zeros(returns_embeddings.shape[1])  # record the positions of action embeddings
         for i in range(returns_embeddings.shape[1]):
-            stacked_input = torch.cat((returns_embeddings[0, i:i + 1], states_embeddings1[0, i:i + 1], states_embeddings2[0, i:i + 1], 
-                                       states_embeddings3[0, i:i + 1], states_embeddings4[0, i:i + 1], states_embeddings5[0, i:i + 1], 
-                                       states_embeddings6[0, i:i + 1], action_embeddings[0, i:i + 1]), dim=0)
+            state_tokens = states_embeddings[0, i]
+            stacked_input = torch.cat((returns_embeddings[0, i:i + 1], state_tokens, action_embeddings[0, i:i + 1]), dim=0)
             stacked_inputs.append(stacked_input)
-            action_embed_positions[i] = (i + 1) * (2 + 6)
+            action_embed_positions[i] = (i + 1) * (2 + self.state_token_count)
         stacked_inputs = torch.cat(stacked_inputs, dim=0).unsqueeze(0)
-        stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]  # truncate sequence length (should not exceed plm embed size)
+        stacked_inputs = self._truncate_token_sequence(stacked_inputs)
         stacked_inputs_ln = self.embed_ln(stacked_inputs)  # layer normalization
         
         # Step 4: feed stacked embeddings into the plm
@@ -137,6 +164,7 @@ class OfflineRLPolicy(nn.Module):
         # Step 5: predict actions
         # we need to locate the logits corresponding to the state embeddings
         # simply using `action_embed_positions[i] - 2` will do.
+        action_embed_positions = action_embed_positions.astype(int)
         logits_used = logits[:, action_embed_positions - 2]
         action_pred = self.action_head(logits_used)
 
@@ -166,21 +194,13 @@ class OfflineRLPolicy(nn.Module):
 
         # Step 4: process state
         state = state.to(self.device)
-        state_features = self.state_encoder(state)
-        state_embeddings1 = self.embed_state1(state_features[0]) + time_embeddings
-        state_embeddings2 = self.embed_state2(state_features[1]) + time_embeddings
-        state_embeddings3 = self.embed_state3(state_features[2]) + time_embeddings
-        state_embeddings4 = self.embed_state4(state_features[3]) + time_embeddings
-        state_embeddings5 = self.embed_state5(state_features[4]) + time_embeddings
-        state_embeddings6 = self.embed_state6(state_features[5]) + time_embeddings
-        state_embeddings = torch.cat([state_embeddings1, state_embeddings2, state_embeddings3, state_embeddings4,
-                                      state_embeddings5, state_embeddings6], dim=1)
+        state_embeddings = self._encode_states(state, time_embeddings).reshape(1, self.state_token_count, self.plm_embed_size)
 
 
         # Step 5: stack return, stage and previous embeddings
         stacked_inputs = torch.cat((return_embeddings, state_embeddings), dim=1)  # mind the order
         stacked_inputs = torch.cat((prev_stacked_inputs, stacked_inputs), dim=1)  # mind the order
-        stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]  # truncate sequence length (should not exceed plm embed size)
+        stacked_inputs = self._truncate_token_sequence(stacked_inputs)
         stacked_inputs_ln = self.embed_ln(stacked_inputs)  # layer normalization
 
         # 1 if can be attended to, 0 if not

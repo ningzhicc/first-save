@@ -149,9 +149,6 @@ def load_plm(model_name, model_path, specials_to_add = None, **kwargs):
         model_config.is_decoder = True
     if 'roberta' in model_name:  # add is_decoder=True for RoBERTa
         model_config.is_decoder = True
-    if 'qwen' in model_name and tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.pad_token_id
 
     # model = model_class.model.from_pretrained(model_path)
     device_input_side = kwargs.pop('device_input_side', None)
@@ -164,6 +161,9 @@ def load_plm(model_name, model_path, specials_to_add = None, **kwargs):
         model = model_class.model.from_pretrained(model_path, config=model_config)
     
     tokenizer = model_class.tokenizer.from_pretrained(model_path) 
+    if 'qwen' in model_name and tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.pad_token_id
     print("If tokenizer is loaded: ",tokenizer.encode("hello world"),"\n")
 
     model, tokenizer = add_special_tokens(model, tokenizer, specials_to_add=specials_to_add)

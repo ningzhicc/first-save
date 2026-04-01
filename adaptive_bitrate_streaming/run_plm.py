@@ -19,7 +19,7 @@ from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
 from plm_special.data.dataset import ExperienceDataset
 from plm_special.models.rl_policy import OfflineRLPolicy
-from plm_special.models.state_encoder import EncoderNetwork
+from plm_special.models.state_encoder import EncoderNetwork, PatchReprogrammingEncoder
 from plm_special.models.low_rank import peft_model
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
@@ -43,6 +43,34 @@ PLM_LAYER_SIZES = {
         'xl': 24
     }
 }
+
+
+def _format_tag_value(value):
+    if isinstance(value, float):
+        return f'{value:g}'.replace('.', 'p')
+    if value is None:
+        return 'na'
+    return str(value).replace('.', 'p')
+
+
+def _build_run_tag(args):
+    if args.state_encoder_type == 'patch_reprogram':
+        encoder_tag = f'pr_sfd{args.state_feature_dim}_pl{args.patch_len}_ps{args.patch_stride}_np{args.num_prototypes}_h{args.reprogram_heads}'
+    else:
+        encoder_tag = f'legacy_sfd{args.state_feature_dim}'
+
+    run_tag = '_'.join([
+        encoder_tag,
+        f'r{args.rank}',
+        f'w{args.w}',
+        f'g{_format_tag_value(args.gamma)}',
+        f'lr{_format_tag_value(args.lr)}',
+        f'wd{_format_tag_value(args.weight_decay)}',
+        f'wu{args.warmup_steps}',
+        f'e{args.num_epochs}',
+        f's{args.seed}',
+    ])
+    return encoder_tag, run_tag
 
 
 def save_model(args, model, save_dir):
@@ -181,13 +209,29 @@ def run(args):
     if args.rank != -1:
         plm = peft_model(plm, args.plm_type, rank=args.rank)
 
+    plm_embed_size = cfg.plm_embed_sizes[args.plm_type][args.plm_size]
+
     # 4.2 create state encoder
     assert args.state_feature_dim is not None, 'please specify state feature dim to create state encoder'
-    state_encoder = EncoderNetwork(embed_dim=args.state_feature_dim)
+    if args.state_encoder_type == 'legacy':
+        state_encoder = EncoderNetwork(embed_dim=args.state_feature_dim)
+    elif args.state_encoder_type == 'patch_reprogram':
+        state_encoder = PatchReprogrammingEncoder(
+            plm_embed_size=plm_embed_size,
+            word_embeddings=plm.get_input_embeddings(),
+            bitrate_levels=BITRATE_LEVELS,
+            patch_embed_dim=args.state_feature_dim,
+            patch_len=args.patch_len,
+            patch_stride=args.patch_stride,
+            num_prototypes=args.num_prototypes,
+            num_heads=args.reprogram_heads,
+            dropout=args.reprogram_dropout,
+        )
+    else:
+        raise ValueError(f'Unsupported state encoder type: {args.state_encoder_type}')
     state_encoder = state_encoder.to(args.device)
 
     # 4.3 create rl policy
-    plm_embed_size = cfg.plm_embed_sizes[args.plm_type][args.plm_size]
     max_ep_len = exp_dataset_info.max_timestep + 1
     rl_policy = OfflineRLPolicy(state_feature_dim=args.state_feature_dim, bitrate_levels=BITRATE_LEVELS, state_encoder=state_encoder, plm=plm, plm_embed_size=plm_embed_size, 
                                            max_length=args.w, max_ep_len=max_ep_len, device=args.device, device_out=args.device_out, which_layer=args.which_layer)
@@ -195,12 +239,13 @@ def run(args):
     # 5. handling directory and path
 
     # extract training experience pool information
-    train_exp_pool_info = args.exp_pool_path.split('/')[-4:-1]
-    train_exp_pool_info = '_'.join(train_exp_pool_info)
-    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
-                              f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
+    exp_pool_name = os.path.splitext(os.path.basename(args.exp_pool_path))[0]
+    sample_step_tag = _format_tag_value(args.sample_step)
+    train_exp_pool_info = f'{exp_pool_name}_ss{sample_step_tag}'
+    encoder_tag, run_tag = _build_run_tag(args)
+    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info, run_tag)
     results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
-                               f'early_stop_{args.which_layer}_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}')
+                               f'{run_tag}_stop{args.which_layer}_tgt{_format_tag_value(args.target_return_scale)}')
     checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
     best_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_best_model')
 
@@ -246,7 +291,13 @@ if __name__ == '__main__':
     parser.add_argument('--plm-size', type=str, default='base')
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
     # state encoder settings
-    parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)
+    parser.add_argument('--state-encoder-type', type=str, default='legacy', choices=['legacy', 'patch_reprogram'])
+    parser.add_argument('--state-feature-dim', type=int, help='feature dim of the legacy encoder or patch embedder', default=256)
+    parser.add_argument('--patch-len', type=int, default=3)
+    parser.add_argument('--patch-stride', type=int, default=1)
+    parser.add_argument('--num-prototypes', type=int, default=64)
+    parser.add_argument('--reprogram-heads', type=int, default=4)
+    parser.add_argument('--reprogram-dropout', type=float, default=0.1)
     # rl policy related settings
     parser.add_argument('--w', type=int, help='context window for learning return distribution', default=20)
     parser.add_argument('--gamma', type=float, help='discounted factor of reward', default=1.)
@@ -304,5 +355,11 @@ if __name__ == '__main__':
 
     print('Arguments:')
     pprint(args)
+
+    if args.state_encoder_type == 'patch_reprogram':
+        assert 1 <= args.patch_len <= BITRATE_LEVELS, 'patch-len should be in [1, 6] for ABR state patches'
+        assert args.patch_stride >= 1, 'patch-stride should be positive'
+        assert args.num_prototypes > 0, 'num-prototypes should be positive'
+        assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
 
     run(args)
