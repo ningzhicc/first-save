@@ -84,7 +84,7 @@ _MODEL_CLASSES = {
     }),
     "llama": ModelClass(**{
         "config": LlamaConfig,
-        "tokenizer": LlamaTokenizer,
+        "tokenizer": AutoTokenizer,
         "model": LlamaModel,
     }),
     "mistral": ModelClass(**{
@@ -104,10 +104,15 @@ def get_model_class(plm_type: str):
     return _MODEL_CLASSES[plm_type]
 
 
-def create_device_map_for_llama(device_input_side: str, device_output_side: str, device_middle_side: str=None):
+def create_device_map_for_llama(
+    num_hidden_layers: int,
+    device_input_side: str,
+    device_output_side: str,
+    device_middle_side: str = None,
+):
     """
-    Create device map for llama. The device map is used to evenly split the llama model into two/three parts on two devices.
-    Currently only supoort llama-7b. We may consider to add support for more versions of llama.
+    Create a device map for Llama-family models.
+    The model is evenly split into two or three segments according to the number of transformer blocks.
     :param device_input_side: The device for the split of model that receives the input (e.g., 'cuda:0').
     :param device_output_side: The device for the split of model that produces the output (e.g., 'cuda:1'). 
     :param device_input_side: The device for the split of model that lies in the middle (e.g., 'cuda:2').
@@ -120,8 +125,9 @@ def create_device_map_for_llama(device_input_side: str, device_output_side: str,
         device_list = [device_input_side, device_output_side]
     else:
         device_list = [device_input_side, device_middle_side, device_output_side]
-    for i in range(32):  # llama-7b has 32 transformer blocks
-        device_map[f'layers.{i}'] = device_list[i // math.ceil(32 / len(device_list))]
+    layers_per_device = math.ceil(num_hidden_layers / len(device_list))
+    for i in range(num_hidden_layers):
+        device_map[f'layers.{i}'] = device_list[min(i // layers_per_device, len(device_list) - 1)]
     device_map['norm'] = device_output_side
     return device_map
 
@@ -155,7 +161,12 @@ def load_plm(model_name, model_path, specials_to_add = None, **kwargs):
     device_output_side = kwargs.pop('device_output_side', None)
     if 'llama' in model_name and device_input_side is not None and device_output_side is not None:
         device_middle_side = kwargs.pop('device_middle_side', None)
-        device_map = create_device_map_for_llama(device_input_side, device_output_side, device_middle_side)
+        device_map = create_device_map_for_llama(
+            model_config.num_hidden_layers,
+            device_input_side,
+            device_output_side,
+            device_middle_side,
+        )
         model = model_class.model.from_pretrained(model_path, config=model_config, device_map=device_map)
     else:
         model = model_class.model.from_pretrained(model_path, config=model_config)

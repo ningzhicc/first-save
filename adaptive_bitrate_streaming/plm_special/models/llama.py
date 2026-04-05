@@ -4,7 +4,13 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaDecoderLayer, LlamaRMSNorm, LlamaConfig
+from transformers.models.llama.modeling_llama import (
+    LlamaConfig,
+    LlamaDecoderLayer,
+    LlamaPreTrainedModel,
+    LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+)
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import add_start_docstrings, logging
 
@@ -64,8 +70,11 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.layer_indices = list(range(len(self.layers)))
 
         self.gradient_checkpointing = False
@@ -120,7 +129,8 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # This custom ABR policy never consumes KV cache from the backbone.
+        use_cache = use_cache if use_cache is not None else False
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -134,19 +144,9 @@ class LlamaModel(LlamaPreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
@@ -155,20 +155,16 @@ class LlamaModel(LlamaPreTrainedModel):
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
+                (batch_size, seq_length), dtype=torch.bool, device=inputs_embeds.device
             )
-            padding_mask = None
-        else:
-            if 0 in attention_mask:
-                padding_mask = attention_mask
-            else:
-                padding_mask = None
 
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length=0
         )
 
         hidden_states = inputs_embeds
+        cache_position = torch.arange(seq_length, device=inputs_embeds.device)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -191,35 +187,44 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
             if self.gradient_checkpointing and self.training:
 
                 def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, past_key_value, output_attentions, padding_mask=padding_mask)
+                    def custom_forward(hidden_states, attention_mask, position_ids, cache_position):
+                        return module(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                        )
 
                     return custom_forward
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer), hidden_states, attention_mask, position_ids
+                    create_custom_forward(decoder_layer),
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    cache_position,
+                    use_reentrant=False,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_value,
+                    past_key_value=None,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    padding_mask=padding_mask,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -242,4 +247,3 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-

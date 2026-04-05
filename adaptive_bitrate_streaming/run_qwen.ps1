@@ -2,7 +2,7 @@ param(
     [ValidateSet('adapt', 'test', 'both')]
     [string]$Mode = 'both',
 
-    [ValidateSet('legacy', 'patch_reprogram')]
+    [ValidateSet('legacy', 'patch_reprogram', 'semantic_reprogram')]
     [string]$StateEncoderType = 'legacy',
 
     [string]$PythonExe = '',
@@ -168,6 +168,12 @@ if ($StateEncoderType -eq 'patch_reprogram') {
         '--patch-len', $PatchLen,
         '--patch-stride', $PatchStride,
         '--num-prototypes', $NumPrototypes,
+        '--reprogram-heads', $ReprogramHeads,
+        '--reprogram-dropout', $ReprogramDropout
+    )
+}
+elseif ($StateEncoderType -eq 'semantic_reprogram') {
+    $commonArgs += @(
         '--reprogram-heads', $ReprogramHeads,
         '--reprogram-dropout', $ReprogramDropout
     )

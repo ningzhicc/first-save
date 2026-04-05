@@ -177,3 +177,134 @@ class PatchReprogrammingEncoder(nn.Module):
         patch_embeddings = self.patch_norm(patch_embeddings)
         reprogrammed = self._reprogram_patches(patch_embeddings)
         return reprogrammed.reshape(batch_size, seq_len, self.num_state_tokens, self.plm_embed_size)
+
+
+class SemanticReprogrammingEncoder(nn.Module):
+    """
+    Reprogram numerical ABR features into the LLM space without explicit patching.
+    This variant follows the teacher's suggestion: keep the 6-step convolutional
+    summarization, then align the resulting numeric tokens with text semantics.
+    """
+
+    FEATURE_DESCRIPTIONS = [
+        'selected bitrate',
+        'buffer size',
+        'throughput history',
+        'download time history',
+        'next chunk sizes',
+        'remaining video chunks',
+    ]
+
+    ANCHOR_TEXTS = [
+        'low bitrate',
+        'high bitrate',
+        'stable bitrate',
+        'buffer low',
+        'buffer safe',
+        'bandwidth drop',
+        'bandwidth stable',
+        'bandwidth rise',
+        'download time long',
+        'download time short',
+        'large next chunk',
+        'small next chunk',
+        'video ending',
+        'many chunks left',
+    ]
+
+    def __init__(
+            self,
+            plm_embed_size,
+            word_embeddings,
+            tokenizer,
+            bitrate_levels=6,
+            numeric_embed_dim=256,
+            num_heads=4,
+            dropout=0.1,
+            conv_size=6,
+    ):
+        super().__init__()
+        if tokenizer is None:
+            raise ValueError('tokenizer is required for semantic reprogramming')
+        if plm_embed_size % num_heads != 0:
+            raise ValueError('plm_embed_size should be divisible by num_heads')
+
+        self.output_mode = 'semantic_reprogram'
+        self.num_state_tokens = 6
+        self.plm_embed_size = plm_embed_size
+        self.num_heads = num_heads
+        self.head_dim = plm_embed_size // num_heads
+        self.tokenizer = tokenizer
+
+        # Reuse the ABR-specific convolutional state summarizer but aggregate the
+        # 6-step history in one shot for temporal channels.
+        self.numeric_encoder = EncoderNetwork(
+            conv_size=conv_size,
+            bitrate_levels=bitrate_levels,
+            embed_dim=numeric_embed_dim,
+        )
+
+        self.numeric_projections = nn.ModuleList([
+            nn.Linear(numeric_embed_dim, plm_embed_size)
+            for _ in range(self.num_state_tokens)
+        ])
+        self.pre_align_norm = nn.LayerNorm(plm_embed_size)
+        self.output_proj = nn.Linear(plm_embed_size, plm_embed_size)
+        self.output_norm = nn.LayerNorm(plm_embed_size)
+        self.dropout = nn.Dropout(dropout)
+
+        self.query_proj = nn.Linear(plm_embed_size, plm_embed_size)
+        self.key_proj = nn.Linear(plm_embed_size, plm_embed_size)
+        self.value_proj = nn.Linear(plm_embed_size, plm_embed_size)
+
+        feature_text_init = self._build_phrase_bank(
+            tokenizer=tokenizer,
+            word_embeddings=word_embeddings,
+            phrases=self.FEATURE_DESCRIPTIONS,
+        )
+        anchor_text_init = self._build_phrase_bank(
+            tokenizer=tokenizer,
+            word_embeddings=word_embeddings,
+            phrases=self.ANCHOR_TEXTS,
+        )
+        self.feature_text_embeddings = nn.Parameter(feature_text_init)
+        self.anchor_embeddings = nn.Parameter(anchor_text_init)
+
+    def _build_phrase_bank(self, tokenizer, word_embeddings, phrases):
+        weight = word_embeddings.weight.detach().cpu()
+        phrase_embeddings = []
+        for phrase in phrases:
+            token_ids = tokenizer.encode(phrase, add_special_tokens=False)
+            if len(token_ids) == 0:
+                raise ValueError(f'Phrase "{phrase}" produces no tokens')
+            token_tensor = torch.as_tensor(token_ids, dtype=torch.long)
+            phrase_embedding = weight.index_select(0, token_tensor).mean(dim=0)
+            phrase_embeddings.append(phrase_embedding)
+        return torch.stack(phrase_embeddings, dim=0)
+
+    def _align_numeric_tokens(self, numeric_tokens):
+        batch_size, token_count, _ = numeric_tokens.shape
+        queries = self.query_proj(numeric_tokens).reshape(batch_size, token_count, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        keys = self.key_proj(self.anchor_embeddings).reshape(self.anchor_embeddings.shape[0], self.num_heads, self.head_dim).permute(1, 0, 2)
+        values = self.value_proj(self.anchor_embeddings).reshape(self.anchor_embeddings.shape[0], self.num_heads, self.head_dim).permute(1, 0, 2)
+
+        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attention_probs = self.dropout(F.softmax(attention_scores, dim=-1))
+        aligned = torch.matmul(attention_probs, values)
+        aligned = aligned.permute(0, 2, 1, 3).reshape(batch_size, token_count, self.plm_embed_size)
+        aligned = self.output_proj(aligned)
+        return self.output_norm(numeric_tokens + self.dropout(aligned))
+
+    def forward(self, state):
+        feature_groups = self.numeric_encoder(state)
+        numeric_tokens = []
+        for feature_idx, feature_group in enumerate(feature_groups):
+            projected = self.numeric_projections[feature_idx](feature_group)
+            numeric_tokens.append(projected)
+
+        numeric_tokens = torch.stack(numeric_tokens, dim=2)
+        numeric_tokens = numeric_tokens + self.feature_text_embeddings.view(1, 1, self.num_state_tokens, -1)
+        batch_size, seq_len = numeric_tokens.shape[0], numeric_tokens.shape[1]
+        numeric_tokens = self.pre_align_norm(numeric_tokens.reshape(batch_size * seq_len, self.num_state_tokens, self.plm_embed_size))
+        aligned_tokens = self._align_numeric_tokens(numeric_tokens)
+        return aligned_tokens.reshape(batch_size, seq_len, self.num_state_tokens, self.plm_embed_size)

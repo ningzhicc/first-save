@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
 from plm_special.data.dataset import ExperienceDataset
 from plm_special.models.rl_policy import OfflineRLPolicy
-from plm_special.models.state_encoder import EncoderNetwork, PatchReprogrammingEncoder
+from plm_special.models.state_encoder import EncoderNetwork, PatchReprogrammingEncoder, SemanticReprogrammingEncoder
 from plm_special.models.low_rank import peft_model
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
@@ -35,6 +36,7 @@ PLM_LAYER_SIZES = {
     },
     'llama': {
         'base': 32,
+        'small': 16,
     },
     't5-lm': { 
         'base': 12,
@@ -43,6 +45,14 @@ PLM_LAYER_SIZES = {
         'xl': 24
     }
 }
+
+
+MODEL_PATH_FALLBACKS = {
+    ('llama', 'small'): os.path.join(cfg.plm_dir, 'llama3.2', 'base'),
+}
+
+
+TRAINING_STATE_FILENAME = 'training_state.pt'
 
 
 def _format_tag_value(value):
@@ -56,6 +66,8 @@ def _format_tag_value(value):
 def _build_run_tag(args):
     if args.state_encoder_type == 'patch_reprogram':
         encoder_tag = f'pr_sfd{args.state_feature_dim}_pl{args.patch_len}_ps{args.patch_stride}_np{args.num_prototypes}_h{args.reprogram_heads}'
+    elif args.state_encoder_type == 'semantic_reprogram':
+        encoder_tag = f'sr_sfd{args.state_feature_dim}_h{args.reprogram_heads}'
     else:
         encoder_tag = f'legacy_sfd{args.state_feature_dim}'
 
@@ -71,6 +83,32 @@ def _build_run_tag(args):
         f's{args.seed}',
     ])
     return encoder_tag, run_tag
+
+
+def _resolve_plm_path(args):
+    if args.plm_path is not None:
+        return args.plm_path
+
+    default_path = os.path.join(cfg.plm_dir, args.plm_type, args.plm_size)
+    if os.path.exists(default_path):
+        return default_path
+
+    fallback_path = MODEL_PATH_FALLBACKS.get((args.plm_type, args.plm_size))
+    if fallback_path is not None and os.path.exists(fallback_path):
+        return fallback_path
+
+    raise FileNotFoundError(
+        f'Cannot find foundation model path for {args.plm_type}/{args.plm_size}. '
+        f'Tried {default_path}. Please pass --plm-path explicitly.'
+    )
+
+
+def _infer_plm_embed_size(model_config):
+    for attr_name in ('hidden_size', 'd_model', 'n_embd', 'word_embed_proj_dim'):
+        attr_value = getattr(model_config, attr_name, None)
+        if attr_value is not None:
+            return attr_value
+    raise ValueError(f'Cannot infer PLM embedding size from config type {type(model_config).__name__}.')
 
 
 def save_model(args, model, save_dir):
@@ -89,14 +127,81 @@ def load_model(args, model, model_dir):
         # load lora weights
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
-        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin')))
+        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location='cpu'))
     else:
         # lora is disabled, load whole model
-        model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
+        model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin'), map_location='cpu'))
     return model
 
 
-def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpoint_dir, best_model_dir, eval_process_reward_fn):
+def _parse_checkpoint_epoch(checkpoint_epoch_dir):
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_epoch_dir))
+    try:
+        return int(checkpoint_name)
+    except ValueError as exc:
+        raise ValueError(f'Checkpoint directory name should be an integer epoch, got: {checkpoint_name}') from exc
+
+
+def _load_train_losses(train_losses_path):
+    if not os.path.exists(train_losses_path) or os.path.getsize(train_losses_path) == 0:
+        return []
+    loaded = np.loadtxt(train_losses_path, ndmin=1)
+    return np.atleast_1d(loaded).astype(float).tolist()
+
+
+def _load_best_eval_return(console_log_path):
+    if not os.path.exists(console_log_path):
+        return 0.0
+
+    best_eval_return = 0.0
+    pattern = re.compile(r"'best_return':\s*([-+eE0-9.]+)")
+    with open(console_log_path, 'r') as handle:
+        for line in handle:
+            match = pattern.search(line)
+            if match is not None:
+                best_eval_return = float(match.group(1))
+    return best_eval_return
+
+
+def _move_optimizer_state_to_param_devices(optimizer):
+    for param, state in optimizer.state.items():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(param.device)
+
+
+def _estimate_completed_optimizer_steps(num_completed_epochs, dataset_size, grad_accum_steps):
+    return num_completed_epochs * int(np.ceil(dataset_size / grad_accum_steps))
+
+
+def _advance_scheduler_steps(lr_scheduler, completed_optimizer_steps):
+    if lr_scheduler is None:
+        return
+    if completed_optimizer_steps <= 0:
+        return
+
+    lr_scheduler.last_epoch = completed_optimizer_steps - 1
+    new_lrs = [
+        base_lr * lr_lambda(lr_scheduler.last_epoch)
+        for base_lr, lr_lambda in zip(lr_scheduler.base_lrs, lr_scheduler.lr_lambdas)
+    ]
+    for param_group, lr in zip(lr_scheduler.optimizer.param_groups, new_lrs):
+        param_group['lr'] = lr
+    lr_scheduler._last_lr = new_lrs
+    lr_scheduler._step_count = max(completed_optimizer_steps, 1)
+
+
+def _save_training_state(checkpoint_epoch_dir, optimizer, lr_scheduler, epoch, best_eval_return):
+    training_state = {
+        'epoch': epoch,
+        'best_eval_return': best_eval_return,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'lr_scheduler_state_dict': None if lr_scheduler is None else lr_scheduler.state_dict(),
+    }
+    torch.save(training_state, os.path.join(checkpoint_epoch_dir, TRAINING_STATE_FILENAME))
+
+
+def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, models_dir, checkpoint_dir, best_model_dir, eval_process_reward_fn):
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -112,15 +217,51 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
     best_eval_return = 0.
+    start_epoch = 0
 
-    total_train_losses = []
-    for epoch in range(args.num_epochs):
+    train_losses_path = os.path.join(checkpoint_dir, 'train_losses.txt')
+    console_log_path = os.path.join(models_dir, f'early_stop_{args.which_layer}_console.log')
+    total_train_losses = _load_train_losses(train_losses_path)
+
+    if args.resume_checkpoint_dir is not None:
+        model = load_model(args, model, args.resume_checkpoint_dir)
+        print('Resume model weights from:', args.resume_checkpoint_dir)
+        checkpoint_epoch = _parse_checkpoint_epoch(args.resume_checkpoint_dir)
+        start_epoch = checkpoint_epoch + 1
+        best_eval_return = _load_best_eval_return(console_log_path)
+
+        resume_state_path = os.path.join(args.resume_checkpoint_dir, TRAINING_STATE_FILENAME)
+        if os.path.exists(resume_state_path):
+            training_state = torch.load(resume_state_path, map_location='cpu')
+            optimizer.load_state_dict(training_state['optimizer_state_dict'])
+            _move_optimizer_state_to_param_devices(optimizer)
+            if lr_scheduler is not None and training_state['lr_scheduler_state_dict'] is not None:
+                lr_scheduler.load_state_dict(training_state['lr_scheduler_state_dict'])
+            best_eval_return = training_state.get('best_eval_return', best_eval_return)
+            start_epoch = training_state.get('epoch', checkpoint_epoch) + 1
+            print('Resume optimizer/scheduler state from:', resume_state_path)
+        else:
+            completed_optimizer_steps = _estimate_completed_optimizer_steps(start_epoch, len(trainer.dataloader), args.grad_accum_steps)
+            _advance_scheduler_steps(lr_scheduler, completed_optimizer_steps)
+            print('Resume checkpoint has no saved optimizer/scheduler state; continuing from model weights only.')
+            print(f'Approximated lr scheduler position with {completed_optimizer_steps} completed optimizer steps.')
+
+        print(f'Resume training from epoch {start_epoch} with best_return={best_eval_return:.12f}')
+
+    if start_epoch >= args.num_epochs:
+        raise ValueError(
+            f'Nothing to train: resume start epoch {start_epoch} is already >= target num_epochs {args.num_epochs}. '
+            f'Please pass a larger --num-epochs value.'
+        )
+
+    for epoch in range(start_epoch, args.num_epochs):
         train_logs, train_losses = trainer.train_epoch()
         total_train_losses.extend(train_losses)
         print('='* 20, f'Training Iteration #{epoch}', '=' * 20)
         print('>' * 10, 'Training Information:')
         pprint(train_logs)
 
+        checkpoint_dir_epoch = None
         if epoch % args.save_checkpoint_per_epoch == 0:  # save checkpoint
             checkpoint_dir_epoch = os.path.join(checkpoint_dir, str(epoch))
             if not os.path.exists(checkpoint_dir_epoch):
@@ -140,9 +281,11 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
             eval_logs['best_return'] = best_eval_return
             print('>' * 10, 'Evaluation Information')
             pprint(eval_logs)
-    # save training losses
-    train_losses_path = os.path.join(checkpoint_dir, 'train_losses.txt')
-    np.savetxt(train_losses_path, total_train_losses, fmt='%.6f', delimiter='\n')
+
+        if checkpoint_dir_epoch is not None:
+            _save_training_state(checkpoint_dir_epoch, optimizer, lr_scheduler, epoch, best_eval_return)
+
+        np.savetxt(train_losses_path, total_train_losses, fmt='%.6f', delimiter='\n')
 
 
 def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, test_process_reward_fn):
@@ -200,8 +343,15 @@ def run(args):
     # For data/modules near the output side, we use args.device_out.
     # For data/modules lying in the middle, we use args.device_mid (it can be None). 
     # If args.device == args.device_out == args.device_mid (if not None), everything will be the same as using only one device.
-    plm, *_ = load_plm(args.plm_type, os.path.join(cfg.plm_dir, args.plm_type, args.plm_size), 
-                       device_input_side=args.device, device_output_side=args.device_out, device_middle_side=args.device_mid)
+    plm_path = _resolve_plm_path(args)
+    print('Foundation model path:', plm_path)
+    plm, tokenizer, model_config = load_plm(
+        args.plm_type,
+        plm_path,
+        device_input_side=args.device,
+        device_output_side=args.device_out,
+        device_middle_side=args.device_mid,
+    )
 
     if args.plm_type != 'llama':
         plm = plm.to(args.device)
@@ -209,7 +359,7 @@ def run(args):
     if args.rank != -1:
         plm = peft_model(plm, args.plm_type, rank=args.rank)
 
-    plm_embed_size = cfg.plm_embed_sizes[args.plm_type][args.plm_size]
+    plm_embed_size = _infer_plm_embed_size(model_config)
 
     # 4.2 create state encoder
     assert args.state_feature_dim is not None, 'please specify state feature dim to create state encoder'
@@ -224,6 +374,16 @@ def run(args):
             patch_len=args.patch_len,
             patch_stride=args.patch_stride,
             num_prototypes=args.num_prototypes,
+            num_heads=args.reprogram_heads,
+            dropout=args.reprogram_dropout,
+        )
+    elif args.state_encoder_type == 'semantic_reprogram':
+        state_encoder = SemanticReprogrammingEncoder(
+            plm_embed_size=plm_embed_size,
+            word_embeddings=plm.get_input_embeddings(),
+            tokenizer=tokenizer,
+            bitrate_levels=BITRATE_LEVELS,
+            numeric_embed_dim=args.state_feature_dim,
             num_heads=args.reprogram_heads,
             dropout=args.reprogram_dropout,
         )
@@ -243,10 +403,17 @@ def run(args):
     sample_step_tag = _format_tag_value(args.sample_step)
     train_exp_pool_info = f'{exp_pool_name}_ss{sample_step_tag}'
     encoder_tag, run_tag = _build_run_tag(args)
-    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info, run_tag)
+    if args.resume_checkpoint_dir is not None:
+        args.resume_checkpoint_dir = os.path.realpath(args.resume_checkpoint_dir)
+        checkpoint_dir = os.path.dirname(args.resume_checkpoint_dir)
+        models_dir = os.path.dirname(checkpoint_dir)
+        run_tag = os.path.basename(models_dir)
+    else:
+        models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info, run_tag)
+        checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
+
     results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
                                f'{run_tag}_stop{args.which_layer}_tgt{_format_tag_value(args.target_return_scale)}')
-    checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
     best_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_best_model')
 
 
@@ -265,9 +432,10 @@ def run(args):
             os.makedirs(checkpoint_dir)
         if not os.path.exists(best_model_dir):
             os.makedirs(best_model_dir)
-        console_log = open(os.path.join(models_dir, f'early_stop_{args.which_layer}_console.log'), 'w')
+        console_log_mode = 'a' if args.resume_checkpoint_dir is not None else 'w'
+        console_log = open(os.path.join(models_dir, f'early_stop_{args.which_layer}_console.log'), console_log_mode)
         sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
-        adapt(args, rl_policy, exp_dataset, exp_dataset_info, env_settings, checkpoint_dir, best_model_dir, process_reward)
+        adapt(args, rl_policy, exp_dataset, exp_dataset_info, env_settings, models_dir, checkpoint_dir, best_model_dir, process_reward)
     if args.test:
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
@@ -289,9 +457,10 @@ if __name__ == '__main__':
     # plm settings
     parser.add_argument('--plm-type', type=str, default='gpt2')
     parser.add_argument('--plm-size', type=str, default='base')
+    parser.add_argument('--plm-path', type=str, help='override the local foundation model path')
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
     # state encoder settings
-    parser.add_argument('--state-encoder-type', type=str, default='legacy', choices=['legacy', 'patch_reprogram'])
+    parser.add_argument('--state-encoder-type', type=str, default='legacy', choices=['legacy', 'patch_reprogram', 'semantic_reprogram'])
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the legacy encoder or patch embedder', default=256)
     parser.add_argument('--patch-len', type=int, default=3)
     parser.add_argument('--patch-stride', type=int, default=1)
@@ -316,6 +485,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', help='random seed', type=int, default=100003)
     parser.add_argument('--scale', help='scale reward/return', type=int, default=1000)
     parser.add_argument('--model-dir', help='model weight dir for testing')
+    parser.add_argument('--resume-checkpoint-dir', help='resume training from a saved checkpoint epoch directory')
     parser.add_argument('--device', action='store', dest='device', help='device (cuda or cpu) to run experiment')
     parser.add_argument('--device-out', action='store', dest='device_out', help='device (cuda or cpu) to place the split of model near the output')
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='device (cuda or cpu) to place the split of model between the input and output')
@@ -360,6 +530,8 @@ if __name__ == '__main__':
         assert 1 <= args.patch_len <= BITRATE_LEVELS, 'patch-len should be in [1, 6] for ABR state patches'
         assert args.patch_stride >= 1, 'patch-stride should be positive'
         assert args.num_prototypes > 0, 'num-prototypes should be positive'
+        assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
+    if args.state_encoder_type == 'semantic_reprogram':
         assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
 
     run(args)
