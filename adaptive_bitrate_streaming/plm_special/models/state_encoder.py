@@ -8,6 +8,86 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class NumericIntraStepAttentionBlock(nn.Module):
+    """
+    Lightweight self-attention in the numeric feature space before semantic alignment.
+    """
+
+    def __init__(self, embed_dim, num_heads, hidden_dim, dropout=0.1):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError('embed_dim should be divisible by num_heads for numeric intra-step attention')
+
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, tokens, attn_mask=None):
+        normed_tokens = self.norm1(tokens)
+        attn_output, _ = self.attn(
+            normed_tokens,
+            normed_tokens,
+            normed_tokens,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+        tokens = tokens + self.dropout1(attn_output)
+
+        normed_tokens = self.norm2(tokens)
+        ffn_output = self.ffn(normed_tokens)
+        return tokens + self.dropout2(ffn_output)
+
+
+class NumericConditionalAttentionBlock(nn.Module):
+    """
+    Condition numeric state tokens on previous-action / previous-reward tokens
+    without mixing state tokens with each other.
+    """
+
+    def __init__(self, embed_dim, num_heads, hidden_dim, dropout=0.1):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError('embed_dim should be divisible by num_heads for numeric conditional attention')
+
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.context_norm = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, state_tokens, context_tokens):
+        normed_state_tokens = self.query_norm(state_tokens)
+        normed_context_tokens = self.context_norm(context_tokens)
+        attn_output, _ = self.attn(
+            normed_state_tokens,
+            normed_context_tokens,
+            normed_context_tokens,
+            need_weights=False,
+        )
+        state_tokens = state_tokens + self.dropout1(attn_output)
+
+        normed_state_tokens = self.ffn_norm(state_tokens)
+        ffn_output = self.ffn(normed_state_tokens)
+        return state_tokens + self.dropout2(ffn_output)
+
+
 class EncoderNetwork(nn.Module):
     """
     The encoder network for encoding each piece of information of the state.
@@ -28,7 +108,7 @@ class EncoderNetwork(nn.Module):
         self.fc6 = nn.Sequential(nn.Linear(1, embed_dim), nn.LeakyReLU())  # remain chunks        
 
 
-    def forward(self, state):
+    def forward(self, state, returns=None, prev_actions=None, prev_rewards=None):
         # state.shape: (batch_size, seq_len, 6, 6) -> (batch_size x seq_len, 6, 6)
         batch_size, seq_len = state.shape[0], state.shape[1]
         state = state.reshape(batch_size * seq_len, 6, 6)
@@ -161,7 +241,7 @@ class PatchReprogrammingEncoder(nn.Module):
         reprogrammed = self.output_proj(reprogrammed) + self.patch_proj(patch_embeddings)
         return self.output_norm(self.dropout(reprogrammed))
 
-    def forward(self, state):
+    def forward(self, state, returns=None, prev_actions=None, prev_rewards=None):
         batch_size, seq_len = state.shape[0], state.shape[1]
         state = state.reshape(batch_size * seq_len, 6, 6)
 
@@ -212,6 +292,13 @@ class SemanticReprogrammingEncoder(nn.Module):
         'many chunks left',
     ]
 
+    PRE_ALIGN_MASK_MODES = {
+        'context_readonly',
+        'state_to_prev_action',
+        'state_to_prev_reward',
+        'state_only',
+    }
+
     def __init__(
             self,
             plm_embed_size,
@@ -222,12 +309,28 @@ class SemanticReprogrammingEncoder(nn.Module):
             num_heads=4,
             dropout=0.1,
             conv_size=6,
+            use_pre_align_intra_step_attn=False,
+            pre_align_intra_step_attn_heads=8,
+            pre_align_intra_step_attn_hidden_dim=1024,
+            pre_align_intra_step_attn_dropout=0.1,
+            use_pre_align_intra_step_mask=False,
+            pre_align_intra_step_mask_mode='context_readonly',
+            use_pre_align_conditional_attn=False,
     ):
         super().__init__()
         if tokenizer is None:
             raise ValueError('tokenizer is required for semantic reprogramming')
         if plm_embed_size % num_heads != 0:
             raise ValueError('plm_embed_size should be divisible by num_heads')
+        if (use_pre_align_intra_step_attn or use_pre_align_conditional_attn) and numeric_embed_dim % pre_align_intra_step_attn_heads != 0:
+            raise ValueError('numeric_embed_dim should be divisible by pre_align_intra_step_attn_heads')
+        if use_pre_align_intra_step_attn and use_pre_align_conditional_attn:
+            raise ValueError('pre-align intra-step self-attention and conditional attention cannot be enabled together')
+        if pre_align_intra_step_mask_mode not in self.PRE_ALIGN_MASK_MODES:
+            raise ValueError(
+                f'Unsupported pre-align intra-step mask mode: {pre_align_intra_step_mask_mode}. '
+                f'Expected one of {sorted(self.PRE_ALIGN_MASK_MODES)}'
+            )
 
         self.output_mode = 'semantic_reprogram'
         self.num_state_tokens = 6
@@ -235,6 +338,11 @@ class SemanticReprogrammingEncoder(nn.Module):
         self.num_heads = num_heads
         self.head_dim = plm_embed_size // num_heads
         self.tokenizer = tokenizer
+        self.numeric_embed_dim = numeric_embed_dim
+        self.use_pre_align_intra_step_attn = use_pre_align_intra_step_attn
+        self.use_pre_align_intra_step_mask = use_pre_align_intra_step_mask
+        self.pre_align_intra_step_mask_mode = pre_align_intra_step_mask_mode
+        self.use_pre_align_conditional_attn = use_pre_align_conditional_attn
 
         # Reuse the ABR-specific convolutional state summarizer but aggregate the
         # 6-step history in one shot for temporal channels.
@@ -243,6 +351,47 @@ class SemanticReprogrammingEncoder(nn.Module):
             bitrate_levels=bitrate_levels,
             embed_dim=numeric_embed_dim,
         )
+
+        if self.use_pre_align_intra_step_attn or self.use_pre_align_conditional_attn:
+            # Keep the historical checkpoint key stable even though this branch now
+            # consumes previous rewards instead of target returns.
+            self.return_context_proj = nn.Linear(1, numeric_embed_dim)
+            self.prev_action_context_proj = nn.Linear(1, numeric_embed_dim)
+        else:
+            self.return_context_proj = None
+            self.prev_action_context_proj = None
+
+        if self.use_pre_align_intra_step_attn:
+            self.pre_align_intra_step_attn = NumericIntraStepAttentionBlock(
+                embed_dim=numeric_embed_dim,
+                num_heads=pre_align_intra_step_attn_heads,
+                hidden_dim=pre_align_intra_step_attn_hidden_dim,
+                dropout=pre_align_intra_step_attn_dropout,
+            )
+            self.intra_step_token_embeddings = nn.Parameter(
+                torch.randn(self.num_state_tokens + 2, numeric_embed_dim) * 0.02
+            )
+            intra_step_attn_mask = self._build_pre_align_intra_step_mask() if self.use_pre_align_intra_step_mask else None
+            self.register_buffer('pre_align_intra_step_attn_mask', intra_step_attn_mask, persistent=False)
+            self.pre_align_conditional_attn = None
+            self.conditional_context_embeddings = None
+        elif self.use_pre_align_conditional_attn:
+            self.pre_align_intra_step_attn = None
+            self.pre_align_conditional_attn = NumericConditionalAttentionBlock(
+                embed_dim=numeric_embed_dim,
+                num_heads=pre_align_intra_step_attn_heads,
+                hidden_dim=pre_align_intra_step_attn_hidden_dim,
+                dropout=pre_align_intra_step_attn_dropout,
+            )
+            self.conditional_context_embeddings = nn.Parameter(
+                torch.randn(2, numeric_embed_dim) * 0.02
+            )
+            self.register_buffer('pre_align_intra_step_attn_mask', None, persistent=False)
+        else:
+            self.pre_align_intra_step_attn = None
+            self.pre_align_conditional_attn = None
+            self.conditional_context_embeddings = None
+            self.register_buffer('pre_align_intra_step_attn_mask', None, persistent=False)
 
         self.numeric_projections = nn.ModuleList([
             nn.Linear(numeric_embed_dim, plm_embed_size)
@@ -295,14 +444,83 @@ class SemanticReprogrammingEncoder(nn.Module):
         aligned = self.output_proj(aligned)
         return self.output_norm(numeric_tokens + self.dropout(aligned))
 
-    def forward(self, state):
-        feature_groups = self.numeric_encoder(state)
-        numeric_tokens = []
-        for feature_idx, feature_group in enumerate(feature_groups):
-            projected = self.numeric_projections[feature_idx](feature_group)
-            numeric_tokens.append(projected)
+    def _build_pre_align_intra_step_mask(self):
+        token_count = self.num_state_tokens + 2
+        attn_mask = torch.zeros((token_count, token_count), dtype=torch.bool)
+        prev_reward_token_idx = self.num_state_tokens
+        prev_action_token_idx = self.num_state_tokens + 1
 
-        numeric_tokens = torch.stack(numeric_tokens, dim=2)
+        # Keep the two context tokens as read-only conditioning signals.
+        for token_idx in (prev_reward_token_idx, prev_action_token_idx):
+            attn_mask[token_idx, :] = True
+            attn_mask[token_idx, token_idx] = False
+
+        if self.pre_align_intra_step_mask_mode == 'context_readonly':
+            return attn_mask
+        if self.pre_align_intra_step_mask_mode == 'state_to_prev_action':
+            attn_mask[:self.num_state_tokens, prev_reward_token_idx] = True
+            return attn_mask
+        if self.pre_align_intra_step_mask_mode == 'state_to_prev_reward':
+            attn_mask[:self.num_state_tokens, prev_action_token_idx] = True
+            return attn_mask
+        if self.pre_align_intra_step_mask_mode == 'state_only':
+            attn_mask[:self.num_state_tokens, prev_reward_token_idx:] = True
+            return attn_mask
+
+        raise ValueError(f'Unsupported pre-align intra-step mask mode: {self.pre_align_intra_step_mask_mode}')
+        return attn_mask
+
+    def _apply_pre_align_intra_step_attention(self, numeric_tokens, prev_rewards, prev_actions):
+        if self.pre_align_intra_step_attn is None:
+            return numeric_tokens
+        if prev_rewards is None or prev_actions is None:
+            raise ValueError('prev_rewards and prev_actions are required when use_pre_align_intra_step_attn is enabled')
+
+        reward_tokens = self.return_context_proj(prev_rewards).unsqueeze(2)
+        prev_action_tokens = self.prev_action_context_proj(prev_actions).unsqueeze(2)
+        intra_step_tokens = torch.cat((numeric_tokens, reward_tokens, prev_action_tokens), dim=2)
+        intra_step_tokens = intra_step_tokens + self.intra_step_token_embeddings.view(1, 1, self.num_state_tokens + 2, -1)
+
+        batch_size, seq_len = intra_step_tokens.shape[0], intra_step_tokens.shape[1]
+        intra_step_tokens = intra_step_tokens.reshape(batch_size * seq_len, self.num_state_tokens + 2, self.numeric_embed_dim)
+        intra_step_tokens = self.pre_align_intra_step_attn(
+            intra_step_tokens,
+            attn_mask=self.pre_align_intra_step_attn_mask,
+        )
+        intra_step_tokens = intra_step_tokens.reshape(batch_size, seq_len, self.num_state_tokens + 2, self.numeric_embed_dim)
+        return intra_step_tokens[:, :, :self.num_state_tokens, :]
+
+    def _apply_pre_align_conditional_attention(self, numeric_tokens, prev_rewards, prev_actions):
+        if self.pre_align_conditional_attn is None:
+            return numeric_tokens
+        if prev_rewards is None or prev_actions is None:
+            raise ValueError('prev_rewards and prev_actions are required when use_pre_align_conditional_attn is enabled')
+
+        reward_tokens = self.return_context_proj(prev_rewards).unsqueeze(2)
+        prev_action_tokens = self.prev_action_context_proj(prev_actions).unsqueeze(2)
+        context_tokens = torch.cat((reward_tokens, prev_action_tokens), dim=2)
+        context_tokens = context_tokens + self.conditional_context_embeddings.view(1, 1, 2, -1)
+
+        batch_size, seq_len = numeric_tokens.shape[0], numeric_tokens.shape[1]
+        state_tokens = numeric_tokens.reshape(batch_size * seq_len, self.num_state_tokens, self.numeric_embed_dim)
+        context_tokens = context_tokens.reshape(batch_size * seq_len, 2, self.numeric_embed_dim)
+        state_tokens = self.pre_align_conditional_attn(state_tokens, context_tokens)
+        return state_tokens.reshape(batch_size, seq_len, self.num_state_tokens, self.numeric_embed_dim)
+
+    def forward(self, state, returns=None, prev_actions=None, prev_rewards=None):
+        feature_groups = self.numeric_encoder(state)
+        numeric_tokens = torch.stack(list(feature_groups), dim=2)
+        if prev_rewards is None:
+            prev_rewards = returns
+        numeric_tokens = self._apply_pre_align_intra_step_attention(numeric_tokens, prev_rewards, prev_actions)
+        numeric_tokens = self._apply_pre_align_conditional_attention(numeric_tokens, prev_rewards, prev_actions)
+
+        projected_tokens = []
+        for feature_idx in range(self.num_state_tokens):
+            projected = self.numeric_projections[feature_idx](numeric_tokens[:, :, feature_idx, :])
+            projected_tokens.append(projected)
+
+        numeric_tokens = torch.stack(projected_tokens, dim=2)
         numeric_tokens = numeric_tokens + self.feature_text_embeddings.view(1, 1, self.num_state_tokens, -1)
         batch_size, seq_len = numeric_tokens.shape[0], numeric_tokens.shape[1]
         numeric_tokens = self.pre_align_norm(numeric_tokens.reshape(batch_size * seq_len, self.num_state_tokens, self.plm_embed_size))

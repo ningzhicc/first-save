@@ -56,8 +56,8 @@ class Trainer:
         return logs, train_losses
 
     def train_step(self, batch):
-        states, actions, returns, timesteps, labels = process_batch(batch, device=self.device)
-        actions_pred = self.model(states, actions, returns, timesteps)
+        states, actions, rewards, returns, timesteps, labels = process_batch(batch, device=self.device)
+        actions_pred = self.model(states, actions, rewards, returns, timesteps)
         actions_pred = actions_pred.permute(0, 2, 1)
         loss = self.loss_fn(actions_pred, labels)
         return loss

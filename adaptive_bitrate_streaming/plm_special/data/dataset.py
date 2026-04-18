@@ -54,14 +54,15 @@ class ExperienceDataset(Dataset):
         """
         if batch_indices is None:
             batch_indices = np.random.choice(len(self.dataset_indices), size=batch_size)
-        batch_states, batch_actions, batch_returns, batch_timesteps = [], [], [], []
+        batch_states, batch_actions, batch_rewards, batch_returns, batch_timesteps = [], [], [], [], []
         for i in range(batch_size):
-            states, actions, returns, timesteps = self[batch_indices[i]]
+            states, actions, rewards, returns, timesteps = self[batch_indices[i]]
             batch_states.append(states)
             batch_actions.append(actions)
+            batch_rewards.append(rewards)
             batch_returns.append(returns)
             batch_timesteps.append(timesteps)
-        return batch_states, batch_actions, batch_returns, batch_timesteps
+        return batch_states, batch_actions, batch_rewards, batch_returns, batch_timesteps
     
     @property
     def states(self):
@@ -81,7 +82,7 @@ class ExperienceDataset(Dataset):
     def __getitem__(self, index):
         start = self.dataset_indices[index]
         end = start + self.max_length
-        return self.states[start:end], self.actions[start:end], self.returns[start:end], self.timesteps[start:end]
+        return self.states[start:end], self.actions[start:end], self.rewards[start:end], self.returns[start:end], self.timesteps[start:end]
 
     def _normalize_rewards(self):
         min_reward, max_reward = min(self.exp_pool.rewards), max(self.exp_pool.rewards)

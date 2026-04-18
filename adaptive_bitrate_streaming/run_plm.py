@@ -64,6 +64,13 @@ def _format_tag_value(value):
 
 
 def _build_run_tag(args):
+    pre_align_mask_tag = None
+    if args.use_pre_align_intra_step_mask:
+        if args.pre_align_intra_step_mask_mode == 'context_readonly':
+            pre_align_mask_tag = 'mask'
+        else:
+            pre_align_mask_tag = f"mask{args.pre_align_intra_step_mask_mode.replace('state_to_', '').replace('_', '')}"
+
     if args.state_encoder_type == 'patch_reprogram':
         encoder_tag = f'pr_sfd{args.state_feature_dim}_pl{args.patch_len}_ps{args.patch_stride}_np{args.num_prototypes}_h{args.reprogram_heads}'
     elif args.state_encoder_type == 'semantic_reprogram':
@@ -71,8 +78,41 @@ def _build_run_tag(args):
     else:
         encoder_tag = f'legacy_sfd{args.state_feature_dim}'
 
-    run_tag = '_'.join([
-        encoder_tag,
+    pre_align_intra_attention_tag = None
+    if args.use_pre_align_intra_step_attn:
+        pre_align_intra_attention_parts = [
+            f'preisa_prev_ar_h{args.pre_align_intra_step_attn_heads}',
+            f'hd{args.pre_align_intra_step_attn_hidden_dim}',
+            f'd{_format_tag_value(args.pre_align_intra_step_attn_dropout)}',
+        ]
+        if pre_align_mask_tag is not None:
+            pre_align_intra_attention_parts.append(pre_align_mask_tag)
+        pre_align_intra_attention_tag = '_'.join(pre_align_intra_attention_parts)
+    elif args.use_pre_align_conditional_attn:
+        pre_align_intra_attention_tag = '_'.join([
+            f'precond_prev_ar_h{args.pre_align_intra_step_attn_heads}',
+            f'hd{args.pre_align_intra_step_attn_hidden_dim}',
+            f'd{_format_tag_value(args.pre_align_intra_step_attn_dropout)}',
+        ])
+
+    intra_attention_tag = 'isa_off'
+    if args.use_gated_intra_state_attn:
+        intra_attention_tag = f'gisa_h{args.intra_state_attn_heads}_d{_format_tag_value(args.intra_state_attn_dropout)}'
+    elif args.use_intra_state_attn:
+        intra_attention_tag = f'isa_h{args.intra_state_attn_heads}_d{_format_tag_value(args.intra_state_attn_dropout)}'
+
+    temporal_attention_tag = 'tsa_off'
+    if args.use_temporal_state_attn:
+        temporal_attention_tag = f'tsa_h{args.temporal_state_attn_heads}_d{_format_tag_value(args.temporal_state_attn_dropout)}'
+        if args.use_temporal_causal_mask:
+            temporal_attention_tag = f'{temporal_attention_tag}_cm'
+
+    run_tag_parts = [encoder_tag]
+    if pre_align_intra_attention_tag is not None:
+        run_tag_parts.append(pre_align_intra_attention_tag)
+    run_tag_parts.extend([
+        intra_attention_tag,
+        temporal_attention_tag,
         f'r{args.rank}',
         f'w{args.w}',
         f'g{_format_tag_value(args.gamma)}',
@@ -82,6 +122,7 @@ def _build_run_tag(args):
         f'e{args.num_epochs}',
         f's{args.seed}',
     ])
+    run_tag = '_'.join(run_tag_parts)
     return encoder_tag, run_tag
 
 
@@ -123,8 +164,25 @@ def save_model(args, model, save_dir):
 
 
 def load_model(args, model, model_dir):
+    target_cuda_device = None
+
+    if torch.cuda.is_available():
+        target_device_name = getattr(args, 'device', None)
+        if target_device_name is not None:
+            target_device = torch.device(target_device_name)
+            if target_device.type == 'cuda':
+                current_cuda_device = torch.cuda.current_device()
+                target_cuda_device = current_cuda_device if target_device.index is None else target_device.index
+
     if args.rank > 0:
         # load lora weights
+        if target_cuda_device is not None:
+            # PEFT infers the adapter load device as plain "cuda", which otherwise
+            # resolves to cuda:0 instead of the user-selected CUDA device.
+            # Keep the current CUDA device on the user-selected target afterwards,
+            # because switching back to a busy default GPU can allocate a new CUDA
+            # context and fail with OOM before evaluation starts.
+            torch.cuda.set_device(target_cuda_device)
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
         model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location='cpu'))
@@ -386,6 +444,13 @@ def run(args):
             numeric_embed_dim=args.state_feature_dim,
             num_heads=args.reprogram_heads,
             dropout=args.reprogram_dropout,
+            use_pre_align_intra_step_attn=args.use_pre_align_intra_step_attn,
+            pre_align_intra_step_attn_heads=args.pre_align_intra_step_attn_heads,
+            pre_align_intra_step_attn_hidden_dim=args.pre_align_intra_step_attn_hidden_dim,
+            pre_align_intra_step_attn_dropout=args.pre_align_intra_step_attn_dropout,
+            use_pre_align_intra_step_mask=args.use_pre_align_intra_step_mask,
+            pre_align_intra_step_mask_mode=args.pre_align_intra_step_mask_mode,
+            use_pre_align_conditional_attn=args.use_pre_align_conditional_attn,
         )
     else:
         raise ValueError(f'Unsupported state encoder type: {args.state_encoder_type}')
@@ -394,7 +459,15 @@ def run(args):
     # 4.3 create rl policy
     max_ep_len = exp_dataset_info.max_timestep + 1
     rl_policy = OfflineRLPolicy(state_feature_dim=args.state_feature_dim, bitrate_levels=BITRATE_LEVELS, state_encoder=state_encoder, plm=plm, plm_embed_size=plm_embed_size, 
-                                           max_length=args.w, max_ep_len=max_ep_len, device=args.device, device_out=args.device_out, which_layer=args.which_layer)
+                                           max_length=args.w, max_ep_len=max_ep_len, device=args.device, device_out=args.device_out, which_layer=args.which_layer,
+                                           use_intra_state_attn=args.use_intra_state_attn,
+                                           use_gated_intra_state_attn=args.use_gated_intra_state_attn,
+                                           intra_state_attn_heads=args.intra_state_attn_heads,
+                                           intra_state_attn_dropout=args.intra_state_attn_dropout,
+                                           use_temporal_state_attn=args.use_temporal_state_attn,
+                                           temporal_state_attn_heads=args.temporal_state_attn_heads,
+                                           temporal_state_attn_dropout=args.temporal_state_attn_dropout,
+                                           use_temporal_causal_mask=args.use_temporal_causal_mask)
 
     # 5. handling directory and path
 
@@ -467,6 +540,27 @@ if __name__ == '__main__':
     parser.add_argument('--num-prototypes', type=int, default=64)
     parser.add_argument('--reprogram-heads', type=int, default=4)
     parser.add_argument('--reprogram-dropout', type=float, default=0.1)
+    parser.add_argument('--use-pre-align-intra-step-attn', action='store_true', help='apply intra-step self-attention in the numeric feature space before semantic alignment')
+    parser.add_argument('--use-pre-align-conditional-attn', action='store_true', help='apply conditional attention from numeric state tokens to previous-action / previous-reward context tokens before semantic alignment')
+    parser.add_argument('--pre-align-intra-step-attn-heads', type=int, default=8, help='number of heads for pre-alignment intra-step attention')
+    parser.add_argument('--pre-align-intra-step-attn-hidden-dim', type=int, default=1024, help='hidden dimension of the FFN inside the pre-alignment intra-step attention block')
+    parser.add_argument('--pre-align-intra-step-attn-dropout', type=float, default=0.1, help='dropout for the pre-alignment intra-step attention block')
+    parser.add_argument('--use-pre-align-intra-step-mask', action='store_true', help='mask the pre-alignment context tokens so return/prev-action remain read-only conditioning signals')
+    parser.add_argument(
+        '--pre-align-intra-step-mask-mode',
+        type=str,
+        default='context_readonly',
+        choices=sorted(SemanticReprogrammingEncoder.PRE_ALIGN_MASK_MODES),
+        help='mask pattern for pre-alignment intra-step self-attention',
+    )
+    parser.add_argument('--use-intra-state-attn', action='store_true', help='apply self-attention among state tokens within each decision step')
+    parser.add_argument('--use-gated-intra-state-attn', action='store_true', help='apply zero-init gated residual self-attention among state tokens within each decision step')
+    parser.add_argument('--intra-state-attn-heads', type=int, default=4, help='number of heads for intra-state self-attention')
+    parser.add_argument('--intra-state-attn-dropout', type=float, default=0.1, help='dropout for intra-state self-attention block')
+    parser.add_argument('--use-temporal-state-attn', action='store_true', help='apply self-attention across decision timesteps for each state-token slot')
+    parser.add_argument('--temporal-state-attn-heads', type=int, default=4, help='number of heads for temporal self-attention')
+    parser.add_argument('--temporal-state-attn-dropout', type=float, default=0.1, help='dropout for temporal self-attention block')
+    parser.add_argument('--use-temporal-causal-mask', action='store_true', help='apply a causal mask in temporal self-attention so each timestep can only attend to itself and the past')
     # rl policy related settings
     parser.add_argument('--w', type=int, help='context window for learning return distribution', default=20)
     parser.add_argument('--gamma', type=float, help='discounted factor of reward', default=1.)
@@ -510,6 +604,7 @@ if __name__ == '__main__':
 
     # command examples:
     # python run_plm.py --adapt --test --grad-accum-steps 32 --seed 666 --plm-type llama --plm-size base --rank 128 --device cuda:0 --state-feature-dim 256 --w 20 --gamma 1. --lr 0.0001 --warmup-steps 2000 --num-epochs 80 --eval-per-epoch 2 --target-return-scale 1
+    # python run_plm.py --adapt --plm-type qwen --plm-size base --device cuda:0 --state-encoder-type semantic_reprogram --use-intra-state-attn --intra-state-attn-heads 4
     # >>> if you want to use your own experience pool, add arguments '--exp-pool-path your_exp_pool_path' <<<
     # >>> if you want to use your own trace dataset, add arguments '--trace your_trace --trace-num number_of_traces --fixed-order (if you want to iterate over all traces in a fixed sequential order)' <<<
     # >>> if you want to use your own video dataset, add arguments '--video your_video'<<<
@@ -533,5 +628,25 @@ if __name__ == '__main__':
         assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
     if args.state_encoder_type == 'semantic_reprogram':
         assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
+    if args.use_pre_align_intra_step_attn:
+        assert args.state_encoder_type == 'semantic_reprogram', 'use-pre-align-intra-step-attn requires state-encoder-type semantic_reprogram'
+        assert args.pre_align_intra_step_attn_heads > 0, 'pre-align-intra-step-attn-heads should be positive'
+        assert args.pre_align_intra_step_attn_hidden_dim > 0, 'pre-align-intra-step-attn-hidden-dim should be positive'
+    if args.use_pre_align_conditional_attn:
+        assert args.state_encoder_type == 'semantic_reprogram', 'use-pre-align-conditional-attn requires state-encoder-type semantic_reprogram'
+        assert args.pre_align_intra_step_attn_heads > 0, 'pre-align-intra-step-attn-heads should be positive'
+        assert args.pre_align_intra_step_attn_hidden_dim > 0, 'pre-align-intra-step-attn-hidden-dim should be positive'
+        assert not args.use_pre_align_intra_step_attn, 'use-pre-align-conditional-attn cannot be combined with use-pre-align-intra-step-attn'
+    if args.use_pre_align_intra_step_mask:
+        assert args.use_pre_align_intra_step_attn, 'use-pre-align-intra-step-mask requires use-pre-align-intra-step-attn'
+    if args.use_intra_state_attn:
+        assert args.intra_state_attn_heads > 0, 'intra-state-attn-heads should be positive'
+    if args.use_gated_intra_state_attn:
+        assert args.intra_state_attn_heads > 0, 'intra-state-attn-heads should be positive'
+        assert not args.use_intra_state_attn, 'use-gated-intra-state-attn cannot be combined with use-intra-state-attn'
+    if args.use_temporal_state_attn:
+        assert args.temporal_state_attn_heads > 0, 'temporal-state-attn-heads should be positive'
+    if args.use_temporal_causal_mask:
+        assert args.use_temporal_state_attn, 'use-temporal-causal-mask requires use-temporal-state-attn'
 
     run(args)

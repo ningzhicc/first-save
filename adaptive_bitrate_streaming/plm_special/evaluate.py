@@ -58,8 +58,11 @@ def evaluate_on_env(args, env_settings, model, target_return, max_ep_num=50, pro
                 target_return = target_return - reward
                 episodes_return += reward
                 episodes_len += 1
+                prev_reward = reward * args.scale
+            else:
+                prev_reward = 0.0
 
-            bit_rate = model.sample(state, target_return, timestep)
+            bit_rate = model.sample(state, target_return, timestep, prev_reward=prev_reward)
             timestep += 1
 
             if end_of_video:

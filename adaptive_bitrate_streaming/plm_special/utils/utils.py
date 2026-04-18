@@ -12,16 +12,17 @@ def process_batch(batch, device='cpu'):
     """
     Process batch of data.
     """
-    states, actions, returns, timesteps = batch
+    states, actions, rewards, returns, timesteps = batch
 
     states = torch.cat(states, dim=0).unsqueeze(0).float().to(device)
     actions = torch.as_tensor(actions, dtype=torch.float32, device=device).reshape(1, -1)
     labels = actions.long()
     actions = ((actions + 1) / BITRATE_LEVELS).unsqueeze(2)
+    rewards = torch.as_tensor(rewards, dtype=torch.float32, device=device).reshape(1, -1, 1)
     returns = torch.as_tensor(returns, dtype=torch.float32, device=device).reshape(1, -1, 1)
     timesteps = torch.as_tensor(timesteps, dtype=torch.int32, device=device).unsqueeze(0)
 
-    return states, actions, returns, timesteps, labels
+    return states, actions, rewards, returns, timesteps, labels
 
 
 def set_random_seed(seed):

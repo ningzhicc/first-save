@@ -21,7 +21,7 @@ GAMMA="1.0"
 LEARNING_RATE="0.0001"
 WEIGHT_DECAY="0.0001"
 WARMUP_STEPS=2000
-NUM_EPOCHS=40
+NUM_EPOCHS=60
 EVAL_PER_EPOCH=2
 GRAD_ACCUM_STEPS=32
 TARGET_RETURN_SCALE="1.0"
@@ -32,6 +32,21 @@ PATCH_STRIDE=1
 NUM_PROTOTYPES=64
 REPROGRAM_HEADS=4
 REPROGRAM_DROPOUT="0.1"
+USE_PRE_ALIGN_INTRA_STEP_ATTN=0
+USE_PRE_ALIGN_CONDITIONAL_ATTN=0
+PRE_ALIGN_INTRA_STEP_ATTN_HEADS=8
+PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM=1024
+PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT="0.1"
+USE_PRE_ALIGN_INTRA_STEP_MASK=0
+PRE_ALIGN_INTRA_STEP_MASK_MODE="context_readonly"
+USE_INTRA_STATE_ATTN=0
+USE_GATED_INTRA_STATE_ATTN=0
+INTRA_STATE_ATTN_HEADS=4
+INTRA_STATE_ATTN_DROPOUT="0.1"
+USE_TEMPORAL_STATE_ATTN=0
+TEMPORAL_STATE_ATTN_HEADS=4
+TEMPORAL_STATE_ATTN_DROPOUT="0.1"
+USE_TEMPORAL_CAUSAL_MASK=0
 FIXED_ORDER=0
 DRY_RUN=0
 EXTRA_ARGS=()
@@ -71,6 +86,21 @@ Options:
   --num-prototypes N
   --reprogram-heads N
   --reprogram-dropout FLOAT
+  --use-pre-align-intra-step-attn
+  --use-pre-align-conditional-attn
+  --pre-align-intra-step-attn-heads N
+  --pre-align-intra-step-attn-hidden-dim N
+  --pre-align-intra-step-attn-dropout FLOAT
+  --use-pre-align-intra-step-mask
+  --pre-align-intra-step-mask-mode {context_readonly|state_to_prev_action|state_to_prev_reward|state_only}
+  --use-intra-state-attn
+  --use-gated-intra-state-attn
+  --intra-state-attn-heads N
+  --intra-state-attn-dropout FLOAT
+  --use-temporal-state-attn
+  --temporal-state-attn-heads N
+  --temporal-state-attn-dropout FLOAT
+  --use-temporal-causal-mask
   --fixed-order
   --dry-run
   -h, --help
@@ -78,6 +108,14 @@ Options:
 Examples:
   ./run_qwen.sh --mode both
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-conditional-attn
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask --pre-align-intra-step-mask-mode state_to_prev_action
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-intra-state-attn
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-gated-intra-state-attn
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn --use-temporal-causal-mask
   ./run_qwen.sh --mode test --model-dir data/ft_plms/qwen_base/.../early_stop_-1_best_model
   ./run_qwen.sh --mode adapt --num-epochs 60 --resume-checkpoint-dir data/ft_plms/llama_small/.../early_stop_-1_checkpoint/38
   ./run_qwen.sh --plm-type llama --plm-size small --plm-path ../downloaded_plms/llama3.2/base --mode both
@@ -321,6 +359,66 @@ while [[ $# -gt 0 ]]; do
       REPROGRAM_DROPOUT="$2"
       shift 2
       ;;
+    --use-pre-align-intra-step-attn)
+      USE_PRE_ALIGN_INTRA_STEP_ATTN=1
+      shift
+      ;;
+    --use-pre-align-conditional-attn)
+      USE_PRE_ALIGN_CONDITIONAL_ATTN=1
+      shift
+      ;;
+    --pre-align-intra-step-attn-heads)
+      PRE_ALIGN_INTRA_STEP_ATTN_HEADS="$2"
+      shift 2
+      ;;
+    --pre-align-intra-step-attn-hidden-dim)
+      PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM="$2"
+      shift 2
+      ;;
+    --pre-align-intra-step-attn-dropout)
+      PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT="$2"
+      shift 2
+      ;;
+    --use-pre-align-intra-step-mask)
+      USE_PRE_ALIGN_INTRA_STEP_MASK=1
+      shift
+      ;;
+    --pre-align-intra-step-mask-mode)
+      PRE_ALIGN_INTRA_STEP_MASK_MODE="$2"
+      shift 2
+      ;;
+    --use-intra-state-attn)
+      USE_INTRA_STATE_ATTN=1
+      shift
+      ;;
+    --use-gated-intra-state-attn)
+      USE_GATED_INTRA_STATE_ATTN=1
+      shift
+      ;;
+    --intra-state-attn-heads)
+      INTRA_STATE_ATTN_HEADS="$2"
+      shift 2
+      ;;
+    --intra-state-attn-dropout)
+      INTRA_STATE_ATTN_DROPOUT="$2"
+      shift 2
+      ;;
+    --use-temporal-state-attn)
+      USE_TEMPORAL_STATE_ATTN=1
+      shift
+      ;;
+    --temporal-state-attn-heads)
+      TEMPORAL_STATE_ATTN_HEADS="$2"
+      shift 2
+      ;;
+    --temporal-state-attn-dropout)
+      TEMPORAL_STATE_ATTN_DROPOUT="$2"
+      shift 2
+      ;;
+    --use-temporal-causal-mask)
+      USE_TEMPORAL_CAUSAL_MASK=1
+      shift
+      ;;
     --fixed-order)
       FIXED_ORDER=1
       shift
@@ -409,6 +507,33 @@ if [[ "$FIXED_ORDER" -eq 1 ]]; then
   COMMON_ARGS+=("--fixed-order")
 fi
 
+if [[ "$USE_INTRA_STATE_ATTN" -eq 1 ]]; then
+  COMMON_ARGS+=(
+    "--use-intra-state-attn"
+    "--intra-state-attn-heads" "$INTRA_STATE_ATTN_HEADS"
+    "--intra-state-attn-dropout" "$INTRA_STATE_ATTN_DROPOUT"
+  )
+fi
+
+if [[ "$USE_GATED_INTRA_STATE_ATTN" -eq 1 ]]; then
+  COMMON_ARGS+=(
+    "--use-gated-intra-state-attn"
+    "--intra-state-attn-heads" "$INTRA_STATE_ATTN_HEADS"
+    "--intra-state-attn-dropout" "$INTRA_STATE_ATTN_DROPOUT"
+  )
+fi
+
+if [[ "$USE_TEMPORAL_STATE_ATTN" -eq 1 ]]; then
+  COMMON_ARGS+=(
+    "--use-temporal-state-attn"
+    "--temporal-state-attn-heads" "$TEMPORAL_STATE_ATTN_HEADS"
+    "--temporal-state-attn-dropout" "$TEMPORAL_STATE_ATTN_DROPOUT"
+  )
+  if [[ "$USE_TEMPORAL_CAUSAL_MASK" -eq 1 ]]; then
+    COMMON_ARGS+=("--use-temporal-causal-mask")
+  fi
+fi
+
 if [[ "$STATE_ENCODER_TYPE" == "patch_reprogram" ]]; then
   COMMON_ARGS+=(
     "--patch-len" "$PATCH_LEN"
@@ -422,6 +547,28 @@ elif [[ "$STATE_ENCODER_TYPE" == "semantic_reprogram" ]]; then
     "--reprogram-heads" "$REPROGRAM_HEADS"
     "--reprogram-dropout" "$REPROGRAM_DROPOUT"
   )
+  if [[ "$USE_PRE_ALIGN_INTRA_STEP_ATTN" -eq 1 ]]; then
+    COMMON_ARGS+=(
+      "--use-pre-align-intra-step-attn"
+      "--pre-align-intra-step-attn-heads" "$PRE_ALIGN_INTRA_STEP_ATTN_HEADS"
+      "--pre-align-intra-step-attn-hidden-dim" "$PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM"
+      "--pre-align-intra-step-attn-dropout" "$PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT"
+    )
+    if [[ "$USE_PRE_ALIGN_INTRA_STEP_MASK" -eq 1 ]]; then
+      COMMON_ARGS+=(
+        "--use-pre-align-intra-step-mask"
+        "--pre-align-intra-step-mask-mode" "$PRE_ALIGN_INTRA_STEP_MASK_MODE"
+      )
+    fi
+  fi
+  if [[ "$USE_PRE_ALIGN_CONDITIONAL_ATTN" -eq 1 ]]; then
+    COMMON_ARGS+=(
+      "--use-pre-align-conditional-attn"
+      "--pre-align-intra-step-attn-heads" "$PRE_ALIGN_INTRA_STEP_ATTN_HEADS"
+      "--pre-align-intra-step-attn-hidden-dim" "$PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM"
+      "--pre-align-intra-step-attn-dropout" "$PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT"
+    )
+  fi
 fi
 
 if [[ "$MODE" == "adapt" || "$MODE" == "both" ]]; then
