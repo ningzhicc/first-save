@@ -88,6 +88,119 @@ class NumericConditionalAttentionBlock(nn.Module):
         return state_tokens + self.dropout2(ffn_output)
 
 
+class ResidualFeatureGate(nn.Module):
+    """
+    Zero-init scalar gate to inject new features conservatively.
+    """
+
+    def __init__(self, init_value=0.0):
+        super().__init__()
+        self.gate = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, base, residual):
+        return base + torch.tanh(self.gate) * residual
+
+
+class MultiScaleHistoryMixer(nn.Module):
+    """
+    TimeMixer-inspired multiscale mixer for short ABR histories.
+    It decomposes each scale into seasonal/trend parts, mixes seasonal
+    information bottom-up and trend information top-down, then fuses
+    all scales into one embedding.
+    """
+
+    def __init__(self, input_length, embed_dim, dropout=0.1):
+        super().__init__()
+        if input_length < 1:
+            raise ValueError('input_length should be positive')
+
+        self.input_length = input_length
+        self.embed_dim = embed_dim
+        self.scale_lengths = self._build_scale_lengths(input_length)
+
+        self.bottom_up_mixers = nn.ModuleList([
+            nn.Linear(self.scale_lengths[idx], self.scale_lengths[idx + 1])
+            for idx in range(len(self.scale_lengths) - 1)
+        ])
+        self.top_down_mixers = nn.ModuleList([
+            nn.Linear(self.scale_lengths[idx + 1], self.scale_lengths[idx])
+            for idx in range(len(self.scale_lengths) - 1)
+        ])
+        self.season_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(scale_length, embed_dim),
+                nn.GELU(),
+            )
+            for scale_length in self.scale_lengths
+        ])
+        self.trend_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(scale_length, embed_dim),
+                nn.GELU(),
+            )
+            for scale_length in self.scale_lengths
+        ])
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dim * len(self.scale_lengths), embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.output_norm = nn.LayerNorm(embed_dim)
+
+    def _build_scale_lengths(self, input_length):
+        scale_lengths = [input_length]
+        while scale_lengths[-1] > 1:
+            scale_lengths.append((scale_lengths[-1] + 1) // 2)
+        return scale_lengths
+
+    def _downsample(self, history):
+        scales = [history]
+        for _ in range(len(self.scale_lengths) - 1):
+            scales.append(F.avg_pool1d(scales[-1], kernel_size=2, stride=2, ceil_mode=True))
+        return scales
+
+    def _series_decompose(self, history):
+        length = history.shape[-1]
+        if length == 1:
+            trend = history
+        elif length == 2:
+            trend = history.mean(dim=-1, keepdim=True).expand_as(history)
+        else:
+            padded = F.pad(history, (1, 1), mode='replicate')
+            trend = F.avg_pool1d(padded, kernel_size=3, stride=1)
+        seasonal = history - trend
+        return seasonal, trend
+
+    def forward(self, history):
+        scales = self._downsample(history)
+        seasonal_scales = []
+        trend_scales = []
+        for scale in scales:
+            seasonal, trend = self._series_decompose(scale)
+            seasonal_scales.append(seasonal)
+            trend_scales.append(trend)
+
+        seasonal_mixed = [seasonal_scales[0]]
+        for idx in range(1, len(seasonal_scales)):
+            propagated = self.bottom_up_mixers[idx - 1](seasonal_mixed[idx - 1])
+            seasonal_mixed.append(seasonal_scales[idx] + propagated)
+
+        trend_mixed = list(trend_scales)
+        for idx in range(len(trend_mixed) - 2, -1, -1):
+            propagated = self.top_down_mixers[idx](trend_mixed[idx + 1])
+            trend_mixed[idx] = trend_mixed[idx] + propagated
+
+        multiscale_embeddings = []
+        for idx in range(len(self.scale_lengths)):
+            seasonal_embed = self.season_projections[idx](seasonal_mixed[idx].squeeze(1))
+            trend_embed = self.trend_projections[idx](trend_mixed[idx].squeeze(1))
+            multiscale_embeddings.append(seasonal_embed + trend_embed)
+
+        fused = self.fusion(torch.cat(multiscale_embeddings, dim=-1))
+        return self.output_norm(fused)
+
+
 class EncoderNetwork(nn.Module):
     """
     The encoder network for encoding each piece of information of the state.
@@ -316,6 +429,7 @@ class SemanticReprogrammingEncoder(nn.Module):
             use_pre_align_intra_step_mask=False,
             pre_align_intra_step_mask_mode='context_readonly',
             use_pre_align_conditional_attn=False,
+            use_history_multiscale_mixer=False,
     ):
         super().__init__()
         if tokenizer is None:
@@ -343,6 +457,7 @@ class SemanticReprogrammingEncoder(nn.Module):
         self.use_pre_align_intra_step_mask = use_pre_align_intra_step_mask
         self.pre_align_intra_step_mask_mode = pre_align_intra_step_mask_mode
         self.use_pre_align_conditional_attn = use_pre_align_conditional_attn
+        self.use_history_multiscale_mixer = use_history_multiscale_mixer
 
         # Reuse the ABR-specific convolutional state summarizer but aggregate the
         # 6-step history in one shot for temporal channels.
@@ -351,6 +466,30 @@ class SemanticReprogrammingEncoder(nn.Module):
             bitrate_levels=bitrate_levels,
             embed_dim=numeric_embed_dim,
         )
+        history_feature_dim = numeric_embed_dim * (6 - conv_size + 1)
+        if self.use_history_multiscale_mixer:
+            self.throughput_history_mixer = MultiScaleHistoryMixer(
+                input_length=6,
+                embed_dim=numeric_embed_dim,
+                dropout=dropout,
+            )
+            self.download_history_mixer = MultiScaleHistoryMixer(
+                input_length=6,
+                embed_dim=numeric_embed_dim,
+                dropout=dropout,
+            )
+            if history_feature_dim == numeric_embed_dim:
+                self.history_mixer_output_proj = nn.Identity()
+            else:
+                self.history_mixer_output_proj = nn.Linear(numeric_embed_dim, history_feature_dim)
+            self.throughput_history_gate = ResidualFeatureGate(init_value=0.0)
+            self.download_history_gate = ResidualFeatureGate(init_value=0.0)
+        else:
+            self.throughput_history_mixer = None
+            self.download_history_mixer = None
+            self.history_mixer_output_proj = None
+            self.throughput_history_gate = None
+            self.download_history_gate = None
 
         if self.use_pre_align_intra_step_attn or self.use_pre_align_conditional_attn:
             # Keep the historical checkpoint key stable even though this branch now
@@ -508,7 +647,27 @@ class SemanticReprogrammingEncoder(nn.Module):
         return state_tokens.reshape(batch_size, seq_len, self.num_state_tokens, self.numeric_embed_dim)
 
     def forward(self, state, returns=None, prev_actions=None, prev_rewards=None):
-        feature_groups = self.numeric_encoder(state)
+        batch_size, seq_len = state.shape[0], state.shape[1]
+        feature_groups = list(self.numeric_encoder(state))
+        if self.use_history_multiscale_mixer:
+            flat_state = state.reshape(batch_size * seq_len, 6, 6)
+            throughput_history = flat_state[:, 2:3, :]
+            download_history = flat_state[:, 3:4, :]
+
+            mixed_throughput = self.throughput_history_mixer(throughput_history)
+            mixed_download = self.download_history_mixer(download_history)
+            mixed_throughput = self.history_mixer_output_proj(mixed_throughput).reshape(batch_size, seq_len, -1)
+            mixed_download = self.history_mixer_output_proj(mixed_download).reshape(batch_size, seq_len, -1)
+
+            feature_groups[2] = self.throughput_history_gate(
+                feature_groups[2],
+                mixed_throughput - feature_groups[2],
+            )
+            feature_groups[3] = self.download_history_gate(
+                feature_groups[3],
+                mixed_download - feature_groups[3],
+            )
+
         numeric_tokens = torch.stack(list(feature_groups), dim=2)
         if prev_rewards is None:
             prev_rewards = returns

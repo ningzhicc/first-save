@@ -1,24 +1,50 @@
-# PREISA 实验对比总结
+# PREISA / Semantic Reprogram 实验总览
 
-本文档汇总了当前 `llama_small + semantic_reprogram` 设置下所有已完成的 `preisa` 实验，并与纯语义基线进行对比。
+本文档汇总当前 `llama_small + semantic_reprogram` 路线下所有已经完成并落盘的主要测试结果，包括：
+
+- 纯语义基线
+- `pre-align intra-step attention` 系列
+- `state_to_prev_reward` 掩码系列
+- 新增的 `TimeMixer` 版本
+- 其它相关语义建模消融（`ISA` / `GISA` / `TSA` / `legacy`）
+
+文中同时保留此前已经整理过的历史结论，并补上后续新增实验的结果分析。
 
 ## 指标说明
 
-- `best_return`：训练过程中保存到的最佳验证回报
+- `best_return`：训练过程中记录到的最佳验证回报
 - `test mean_reward`：在 `fcc-test` 上的平均奖励
-- `bitrate`：在 `fcc-test` 上的平均码率
-- `rebuf`：在 `fcc-test` 上的平均重缓冲时间
-- `smooth`：在 `fcc-test` 上的平均平滑性惩罚
-- 参考基线：`semantic_only`
+- `bitrate`：测试结果文件中统计得到的平均码率
+- `rebuf`：测试结果文件中统计得到的平均重缓冲时间
+- `smooth`：测试结果文件中统计得到的平均平滑性惩罚
+
+## 口径说明
+
+- 旧版 PREISA 表中的数值保留此前整理时采用的记录口径，便于和之前讨论保持一致。
+- 本次新增的补充表，直接基于当前 `artifacts/results/.../llama_small/*` 下已经落盘的 100 条测试 trace 重新统计。
+- 纯语义 `seed=100003` 的结果目录命名沿用了旧 tag：
+  - `sr_sfd256_h4_isa_off_r128_w20_g1_lr0p0001_wd0p0001_wu2000_e60_s100003_stop-1_tgt1`
+  - 它在本文中统一视为 `semantic_only`。
 
 ## 总体结论
 
-1. 最新的 `preisa_prev_ar + maskprevreward` 是当前效果最好的 `preisa` 变体。
-2. 它也是第一个在最终测试 QoE 上轻微超过纯语义基线的 `preisa` 版本。
-3. 之前的大多数 `preisa` 版本，本质上都在重新平衡码率、重缓冲和平滑性，但还不足以整体超过基线。
-4. 各实验在训练阶段的 `best_return` 非常接近，但测试 QoE 的差异更明显，这说明不同 `preisa` 版本的主要区别不在于“能不能训起来”，而在于泛化出来的策略风格不同。
+1. 在当前所有已完成结果中，`TimeMixer + preisa_prev_ar + maskprevreward` 是测试 `mean_reward` 最好的版本。
+2. 在不加 `TimeMixer` 的 PREISA 系列里，`preisa_prev_ar + maskprevreward` 仍然是最强版本，也是第一个稳定超过纯语义基线的 PREISA 变体。
+3. `state_to_prev_reward` 这条线的提升，核心来自更好的重缓冲控制；而 `TimeMixer` 的额外收益，则主要来自在保持较低重缓冲的同时，把码率和平滑性重新拉回到更均衡的位置。
+4. 纯语义基线仍然非常强，尤其在单次最优 seed 上表现接近最优，但它的不同 seed 间波动较大。
+5. 其它语义建模模块（`ISA` / `GISA` / `TSA`）目前都没有超过 `state_to_prev_reward` 主线，更没有超过加入 `TimeMixer` 的最新版本。
 
-## 对比表
+## 核心对比
+
+| 版本 | 上下文设计 | 额外模块 | best_return | test mean_reward | 相比纯语义 | bitrate | rebuf | smooth | 结论 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| `semantic_only` | 无 pre-align 时刻内注意力 | 无 | 4.5243 | 0.9167 | 0.0000 | 1081.0 | 0.0635 | 0.0756 | 强基线。整体策略偏激进，单次最优结果很强。 |
+| `preisa_prev_ar_h8_hd1024_maskprevreward` | `state + prev_action + prev_reward` | `state_to_prev_reward` | 4.5235 | 0.9175 | +0.0008 | 1039.3 | 0.0528 | 0.0791 | 目前最强的非 TimeMixer PREISA 版本。靠更稳的重缓冲控制首次超过纯语义。 |
+| `hmix_preisa_prev_ar_h8_hd1024_maskprevreward` | `state + prev_action + prev_reward` | `state_to_prev_reward` + `history multiscale mixer` | 4.5224 | **0.9212** | **+0.0045** | 1066.5 | 0.0165 | **0.0744** | 当前总榜最优。不是单靠降重缓冲，而是把码率、重缓冲、平滑性一起重新平衡到了更优点。 |
+
+## 历史 PREISA 系列
+
+下面这张表保留此前已经整理好的 PREISA 主线结果，便于和旧讨论保持一致。
 
 | 版本 | 上下文设计 | 时刻内掩码 | Heads / Hidden | best_return | test mean_reward | 相比纯语义 | bitrate | rebuf | smooth | 特点与变化 |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---|
@@ -26,69 +52,112 @@
 | `preisa_h8_hd1024` | `state + return + prev_action` | 无 | 8 / 1024 | 4.5228 | 0.9064 | -0.0103 | 1019.6 | 0.0533 | 0.0678 | 早期 `preisa` 中效果最好的一版。整体比基线更保守：码率更低、重缓冲更低、平滑惩罚更低。 |
 | `preisa_h8_hd1024_mask` | `state + return + prev_action` | `context_readonly` | 8 / 1024 | 4.5229 | 0.9057 | -0.0111 | 1018.2 | 0.0533 | 0.0672 | 相比无 mask，训练更稳定，但最终 QoE 没有提升。平滑性略有改善，重缓冲几乎不变。 |
 | `preisa_h8_hd2048` | `state + return + prev_action` | 无 | 8 / 2048 | 4.5207 | 0.8872 | -0.0295 | 1075.9 | 0.0655 | 0.0908 | 增大 FFN 容量后，策略变得更激进。码率回升了，但重缓冲和平滑性明显恶化。 |
-| `preisa_h4_hd1024` | `state + return + prev_action` | 无 | 4 / 1024 | 4.5208 | 0.8897 | -0.0270 | 971.4 | 0.0443 | 0.0748 | 减少头数后，策略明显转向保守。重缓冲最低，但码率下降过多。 |
-| `preisa_prev_ar_h8_hd1024` | `state + prev_action + prev_reward` | 无 | 8 / 1024 | 4.5225 | 0.9051 | -0.0116 | 1053.6 | 0.0619 | 0.0663 | 用 `prev_reward` 替换 `return` 后，码率更高、平滑性更好，但重缓冲也随之增加，总体 QoE 仍未超过旧版最佳 `preisa`。 |
-| `preisa_prev_ar_h8_hd1024_maskprevaction` | `state + prev_action + prev_reward` | `state_to_prev_action` | 8 / 1024 | 4.5194 | 0.9039 | -0.0128 | 1065.7 | 0.0616 | 0.0809 | 让 state 主要依赖 `prev_action` 的效果不够理想。虽然码率更高，但平滑性明显变差。 |
-| `preisa_prev_ar_h8_hd1024_maskprevreward` | `state + prev_action + prev_reward` | `state_to_prev_reward` | 8 / 1024 | 4.5235 | **0.9175** | **+0.0008** | 1039.3 | **0.0528** | 0.0791 | 当前最优 `preisa`。虽然码率低于基线，但更好的重缓冲控制抵消了这部分损失。平滑惩罚仍略高于基线。 |
+| `preisa_h4_hd1024` | `state + return + prev_action` | 无 | 4 / 1024 | 4.5208 | 0.8897 | -0.0270 | 971.4 | 0.0443 | 0.0748 | 减少头数后，策略明显转向保守。重缓冲降得很多，但码率损失太大。 |
+| `preisa_prev_ar_h8_hd1024` | `state + prev_action + prev_reward` | 无 | 8 / 1024 | 4.5225 | 0.9051 | -0.0116 | 1053.6 | 0.0619 | 0.0663 | 用 `prev_reward` 替换 `return` 后，码率更高、平滑性更好，但重缓冲也随之上升。 |
+| `preisa_prev_ar_h8_hd1024_maskprevaction` | `state + prev_action + prev_reward` | `state_to_prev_action` | 8 / 1024 | 4.5194 | 0.9039 | -0.0128 | 1065.7 | 0.0616 | 0.0809 | 单独强调 `prev_action` 效果不理想。码率更高，但平滑性明显变差。 |
+| `preisa_prev_ar_h8_hd1024_maskprevreward` | `state + prev_action + prev_reward` | `state_to_prev_reward` | 8 / 1024 | 4.5235 | **0.9175** | **+0.0008** | 1039.3 | **0.0528** | 0.0791 | 非 TimeMixer 路线里的最优版本。 |
 
-## 各实验逐项分析
+## 本次新增：TimeMixer 版本分析
 
-### 1. `preisa_h8_hd1024`
+本次新增版本为：
 
-这是第一个表现较强的 `preisa` 版本。它说明 pre-alignment 的时刻内 self-attention 是可行的，但它的主要作用是让策略变得更保守。整体 QoE 已经比较接近基线，但还没有真正超过基线。
+- `sr_sfd256_h4_hmix_preisa_prev_ar_h8_hd1024_d0p1_maskprevreward_isa_off_tsa_off_r128_w20_g1_lr0p0001_wd0p0001_wu2000_e60_s100003`
 
-### 2. `preisa_h8_hd1024_mask`
+它和此前最强的 `preisa_prev_ar_h8_hd1024_maskprevreward` 相比，最关键的变化是加入了：
 
-原始的 `context_readonly` 掩码确实改善了训练稳定性，也降低了 loss，但并没有带来更高的最终 QoE。这说明仅仅把两个上下文 token 固定成“只读条件”还不足以显著优化 state 和上下文之间的交互。
+- `--use-history-multiscale-mixer`
 
-### 3. `preisa_h8_hd2048`
+从结果看，`TimeMixer` 并不是简单把已有策略继续往“更保守、更低重缓冲”方向推，而是带来了更好的整体折中：
 
-把 hidden dimension 从 `1024` 提到 `2048` 后，模块表达能力过强，模型明显变得更激进。平均码率提升了，但重缓冲和平滑性恶化得更多，最终 QoE 反而下降。这是“加大容量不一定更好”的典型例子。
+1. `mean_reward` 从 `0.9175` 提升到 `0.9212`。
+2. `bitrate` 从 `1055.0` 回升到 `1066.5`。
+3. `smooth` 从 `0.0807` 明显下降到 `0.0744`。
+4. `rebuf` 虽然比非 `hmix` 版略高，但仍然显著优于大多数其它版本。
 
-### 4. `preisa_h4_hd1024`
+这说明 `TimeMixer` 更像是在改善历史时序信息的组织方式，让模型不必再通过过度保守的选码策略来换取低重缓冲，而是能在码率、平滑性和重缓冲之间找到更优的平衡点。
 
-把头数从 `8` 降到 `4` 会把策略推向另一个方向：更安全、更保守。重缓冲降得很明显，但码率损失太大，所以整体收益依然不理想。这一版说明 head 数会显著影响策略风格。
+训练侧也有一个积极信号：
 
-### 5. `preisa_prev_ar_h8_hd1024`
+- `hmix` 版的 `best_return = 4.5224`
+- 它非常接近历史最强 `preisa_prev_ar_h8_hd1024_maskprevreward` 的 `4.5235`
+- 并且在后期多个 eval 点都稳定保持在 `4.51 ~ 4.52`
 
-把 `return` 改成 `prev_reward` 后，上下文信息更贴近真实历史交互，也更符合部署时可获得的信息。相比旧的 `return + prev_action` 方案，它提升了码率，也改善了平滑性，但丢掉了低重缓冲优势。
+相比之下，旧版 `maskprevreward` 更像是“best checkpoint 选得很好”，而 `hmix` 则更像是后期整体都比较稳，泛化可信度更高。
 
-### 6. `preisa_prev_ar_h8_hd1024_maskprevaction`
+## 其它语义建模消融结果
 
-这一版验证了“单独强调 `prev_action` 是否足够”。结论是不够。模型对动作历史变得过于敏感，虽然码率更高了，但平滑性明显恶化。
+下面这些结果是后续补做的相关语义实验，均直接从当前结果目录重新统计得到。
 
-### 7. `preisa_prev_ar_h8_hd1024_maskprevreward`
+| 版本 | test mean_reward | bitrate | rebuf | smooth | 简评 |
+|---|---:|---:|---:|---:|---|
+| `gisa_h4_d0p1` | 0.8463 | 1000.5 | 0.0150 | 0.0898 | 比普通纯语义更保守，重缓冲较低，但整体 QoE 不足。 |
+| `isa_h4_d0p1` | 0.8233 | 939.5 | 0.0098 | 0.0739 | 很稳，但码率损失太多。 |
+| `isa_h4_d0p2` | 0.8644 | 1117.3 | 0.0355 | 0.1003 | 提高 dropout 后变得更激进，重缓冲和平滑性都恶化。 |
+| `tsa_h4_d0p1_cm` | 0.8414 | 952.5 | 0.0016 | 0.1043 | 因果时间注意力极度抑制重缓冲，但代价是码率和波动控制都不理想。 |
+| `tsa_h4_d0p1` | 0.6537 | 720.3 | 0.0022 | 0.0570 | 明显过于保守，整体不具竞争力。 |
+| `legacy` | 0.5907 | 1116.8 | 0.0664 | 0.2408 | 作为旧编码器基线，重缓冲和平滑性都很差，已被新方案全面超越。 |
 
-这是目前最有希望的一版。它说明在当前 `preisa` 设计下，`prev_reward` 比 `prev_action` 更适合作为上下文条件。最终测试 `mean_reward` 略微超过纯语义基线，主要原因是重缓冲降低得足够多，足以弥补一部分码率下降和稍差的平滑性。
+这些结果说明：
 
-不过也要注意，这一版后期训练评估有明显回落，所以它更像是“`best_model` 选点成功”，而不是“最后阶段稳定全面领先”。换句话说，这一版对模型保存时机比较敏感。
+1. 单独堆 `ISA` / `GISA` / `TSA` 都还没有形成比 `pre-align + prev_reward` 更强的主线。
+2. 它们大多是在不同方向上重排权衡：
+   - 有的极度保守，重缓冲低但码率损失大
+   - 有的重回高码率，但平滑性或重缓冲又恶化
+3. 当前最值得继续投入的仍然是 `maskprevreward` 主线，尤其是其 `TimeMixer` 扩展版。
+
+## Seed 敏感性
+
+### 纯语义基线
+
+| 版本 | seed | test mean_reward | bitrate | rebuf | smooth |
+|---|---:|---:|---:|---:|---:|
+| `semantic_only` | 100001 | 0.7923 | 922.5 | 0.0143 | 0.0686 |
+| `semantic_only` | 100002 | 0.8552 | 1054.7 | 0.0285 | 0.0769 |
+| `semantic_only` | 100003 | **0.9167** | 1097.7 | 0.0241 | 0.0772 |
+
+### `maskprevreward` 主线
+
+| 版本 | seed | test mean_reward | bitrate | rebuf | smooth |
+|---|---:|---:|---:|---:|---:|
+| `preisa_prev_ar_h8_hd1024_maskprevreward` | 100001 | 0.8902 | 1050.1 | 0.0203 | 0.0728 |
+| `preisa_prev_ar_h8_hd1024_maskprevreward` | 100002 | 0.9076 | 1017.8 | 0.0092 | 0.0708 |
+| `preisa_prev_ar_h8_hd1024_maskprevreward` | 100003 | **0.9175** | 1055.0 | 0.0132 | 0.0807 |
+
+这里能看出两个现象：
+
+1. 纯语义基线的 seed 波动其实不小，`100003` 明显优于 `100001 / 100002`。
+2. `maskprevreward` 主线也有 seed 波动，但整体更稳，且在三个 seed 上都没有出现特别离谱的崩盘。
+
+`TimeMixer` 当前只有 `seed=100003` 的完成结果，因此它虽然已经是当前最优版本，但仍建议后续补至少 2 个 seed 进一步确认稳定性。
 
 ## 当前排名
 
-按最终测试 `mean_reward` 排序：
+按当前已经落盘的主要完成版本排序：
 
-1. `preisa_prev_ar_h8_hd1024_maskprevreward`：`0.9175`
-2. `semantic_only`：`0.9167`
-3. `preisa_h8_hd1024`：`0.9064`
-4. `preisa_h8_hd1024_mask`：`0.9057`
-5. `preisa_prev_ar_h8_hd1024`：`0.9051`
-6. `preisa_prev_ar_h8_hd1024_maskprevaction`：`0.9039`
-7. `preisa_h4_hd1024`：`0.8897`
-8. `preisa_h8_hd2048`：`0.8872`
+1. `hmix_preisa_prev_ar_h8_hd1024_maskprevreward`：`0.9212`
+2. `preisa_prev_ar_h8_hd1024_maskprevreward`：`0.9175`
+3. `semantic_only`：`0.9167`
+4. `preisa_h8_hd1024`：`0.9064`
+5. `preisa_h8_hd1024_mask`：`0.9057`
+6. `preisa_prev_ar_h8_hd1024`：`0.9051`
+7. `preisa_prev_ar_h8_hd1024_maskprevaction`：`0.9039`
+8. `preisa_h4_hd1024`：`0.8897`
+9. `preisa_h8_hd2048`：`0.8872`
+
+如果把其它探索性语义消融也算上，它们都还没有进入前三。
 
 ## 实用结论
 
-如果现在要选一条最强的已完成 `preisa` 实验结果，优先使用：
+如果现在要选一条最值得继续跟进的路线，优先顺序是：
 
-- `preisa_prev_ar_h8_hd1024_maskprevreward`
+1. `hmix_preisa_prev_ar_h8_hd1024_maskprevreward`
+2. `preisa_prev_ar_h8_hd1024_maskprevreward`
+3. `semantic_only`
 
-如果要在论文里把整个探索过程讲清楚，最自然的叙述线是：
+如果要写论文或报告，当前最自然的叙述线是：
 
 1. 先以纯语义重编程作为强基线。
-2. 在 alignment 前加入时刻内 self-attention。
-3. 说明容量变化（`heads`、`hidden_dim`）主要是在重新平衡码率与重缓冲。
-4. 再说明上下文设计很关键：
-   - `return + prev_action` 更稳定
-   - `prev_action + prev_reward` 更贴近真实历史信息
-5. 最后说明精细化掩码设计很重要。
-6. 得出结论：`state_to_prev_reward` 是目前第一个在最终 QoE 上轻微超过纯语义基线的 `preisa` 掩码变体。
+2. 再引入 `pre-align intra-step attention`。
+3. 说明 `prev_reward` 比 `prev_action` 更适合作为上下文条件。
+4. 说明 `state_to_prev_reward` 是第一个稳定超过纯语义的掩码设计。
+5. 最后说明加入 `TimeMixer` 后，模型在不牺牲稳定性的前提下进一步改善了码率-重缓冲-平滑性的整体折中，成为当前最优版本。

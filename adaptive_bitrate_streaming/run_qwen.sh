@@ -12,6 +12,7 @@ DEVICE="cuda:0"
 EXP_POOL_PATH="artifacts/exp_pools/exp_pool.pkl"
 MODEL_DIR=""
 RESUME_CHECKPOINT_DIR=""
+ALLOW_PARTIAL_RESUME=0
 TRACE_NAME="fcc-test"
 TRACE_NUM=100
 VIDEO_NAME="video1"
@@ -39,6 +40,7 @@ PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM=1024
 PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT="0.1"
 USE_PRE_ALIGN_INTRA_STEP_MASK=0
 PRE_ALIGN_INTRA_STEP_MASK_MODE="context_readonly"
+USE_HISTORY_MULTISCALE_MIXER=0
 USE_INTRA_STATE_ATTN=0
 USE_GATED_INTRA_STATE_ATTN=0
 INTRA_STATE_ATTN_HEADS=4
@@ -66,6 +68,7 @@ Options:
   --exp-pool-path PATH
   --model-dir PATH
   --resume-checkpoint-dir PATH
+  --allow-partial-resume
   --trace NAME
   --trace-num N
   --video NAME
@@ -93,6 +96,7 @@ Options:
   --pre-align-intra-step-attn-dropout FLOAT
   --use-pre-align-intra-step-mask
   --pre-align-intra-step-mask-mode {context_readonly|state_to_prev_action|state_to_prev_reward|state_only}
+  --use-history-multiscale-mixer
   --use-intra-state-attn
   --use-gated-intra-state-attn
   --intra-state-attn-heads N
@@ -112,12 +116,14 @@ Examples:
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-conditional-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask --pre-align-intra-step-mask-mode state_to_prev_action
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask --pre-align-intra-step-mask-mode state_to_prev_reward --use-history-multiscale-mixer
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-intra-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-gated-intra-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn --use-temporal-causal-mask
   ./run_qwen.sh --mode test --model-dir data/ft_plms/qwen_base/.../early_stop_-1_best_model
   ./run_qwen.sh --mode adapt --num-epochs 60 --resume-checkpoint-dir data/ft_plms/llama_small/.../early_stop_-1_checkpoint/38
+  ./run_qwen.sh --mode adapt --resume-checkpoint-dir data/ft_plms/llama_small/.../early_stop_-1_checkpoint/59 --allow-partial-resume --state-encoder-type semantic_reprogram --use-history-multiscale-mixer
   ./run_qwen.sh --plm-type llama --plm-size small --plm-path ../downloaded_plms/llama3.2/base --mode both
   ./run_qwen.sh --mode adapt -- --which-layer 8
 EOF
@@ -279,6 +285,10 @@ while [[ $# -gt 0 ]]; do
       RESUME_CHECKPOINT_DIR="$2"
       shift 2
       ;;
+    --allow-partial-resume)
+      ALLOW_PARTIAL_RESUME=1
+      shift
+      ;;
     --trace)
       TRACE_NAME="$2"
       shift 2
@@ -386,6 +396,10 @@ while [[ $# -gt 0 ]]; do
     --pre-align-intra-step-mask-mode)
       PRE_ALIGN_INTRA_STEP_MASK_MODE="$2"
       shift 2
+      ;;
+    --use-history-multiscale-mixer)
+      USE_HISTORY_MULTISCALE_MIXER=1
+      shift
       ;;
     --use-intra-state-attn)
       USE_INTRA_STATE_ATTN=1
@@ -547,6 +561,9 @@ elif [[ "$STATE_ENCODER_TYPE" == "semantic_reprogram" ]]; then
     "--reprogram-heads" "$REPROGRAM_HEADS"
     "--reprogram-dropout" "$REPROGRAM_DROPOUT"
   )
+  if [[ "$USE_HISTORY_MULTISCALE_MIXER" -eq 1 ]]; then
+    COMMON_ARGS+=("--use-history-multiscale-mixer")
+  fi
   if [[ "$USE_PRE_ALIGN_INTRA_STEP_ATTN" -eq 1 ]]; then
     COMMON_ARGS+=(
       "--use-pre-align-intra-step-attn"
@@ -580,6 +597,9 @@ if [[ "$MODE" == "adapt" || "$MODE" == "both" ]]; then
   )
   if [[ -n "$RESOLVED_RESUME_CHECKPOINT_DIR" ]]; then
     ADAPT_ARGS+=("--resume-checkpoint-dir" "$RESOLVED_RESUME_CHECKPOINT_DIR")
+  fi
+  if [[ "$ALLOW_PARTIAL_RESUME" -eq 1 ]]; then
+    ADAPT_ARGS+=("--allow-partial-resume")
   fi
   if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
     ADAPT_ARGS+=("${EXTRA_ARGS[@]}")

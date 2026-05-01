@@ -75,6 +75,8 @@ def _build_run_tag(args):
         encoder_tag = f'pr_sfd{args.state_feature_dim}_pl{args.patch_len}_ps{args.patch_stride}_np{args.num_prototypes}_h{args.reprogram_heads}'
     elif args.state_encoder_type == 'semantic_reprogram':
         encoder_tag = f'sr_sfd{args.state_feature_dim}_h{args.reprogram_heads}'
+        if args.use_history_multiscale_mixer:
+            encoder_tag = f'{encoder_tag}_hmix'
     else:
         encoder_tag = f'legacy_sfd{args.state_feature_dim}'
 
@@ -185,10 +187,23 @@ def load_model(args, model, model_dir):
             torch.cuda.set_device(target_cuda_device)
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
-        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location='cpu'))
+        modules_except_plm_state = torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location='cpu')
+        incompatible = model.modules_except_plm.load_state_dict(
+            modules_except_plm_state,
+            strict=not args.allow_partial_resume,
+        )
+        if args.allow_partial_resume:
+            print('Partial resume for modules_except_plm is enabled.')
+            print('Missing keys:', list(incompatible.missing_keys))
+            print('Unexpected keys:', list(incompatible.unexpected_keys))
     else:
         # lora is disabled, load whole model
-        model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin'), map_location='cpu'))
+        full_state = torch.load(os.path.join(model_dir, 'model.bin'), map_location='cpu')
+        incompatible = model.load_state_dict(full_state, strict=not args.allow_partial_resume)
+        if args.allow_partial_resume:
+            print('Partial resume for full model is enabled.')
+            print('Missing keys:', list(incompatible.missing_keys))
+            print('Unexpected keys:', list(incompatible.unexpected_keys))
     return model
 
 
@@ -451,6 +466,7 @@ def run(args):
             use_pre_align_intra_step_mask=args.use_pre_align_intra_step_mask,
             pre_align_intra_step_mask_mode=args.pre_align_intra_step_mask_mode,
             use_pre_align_conditional_attn=args.use_pre_align_conditional_attn,
+            use_history_multiscale_mixer=args.use_history_multiscale_mixer,
         )
     else:
         raise ValueError(f'Unsupported state encoder type: {args.state_encoder_type}')
@@ -546,6 +562,7 @@ if __name__ == '__main__':
     parser.add_argument('--pre-align-intra-step-attn-hidden-dim', type=int, default=1024, help='hidden dimension of the FFN inside the pre-alignment intra-step attention block')
     parser.add_argument('--pre-align-intra-step-attn-dropout', type=float, default=0.1, help='dropout for the pre-alignment intra-step attention block')
     parser.add_argument('--use-pre-align-intra-step-mask', action='store_true', help='mask the pre-alignment context tokens so return/prev-action remain read-only conditioning signals')
+    parser.add_argument('--use-history-multiscale-mixer', action='store_true', help='apply a TimeMixer-inspired multiscale mixer to throughput/download-time history before semantic alignment')
     parser.add_argument(
         '--pre-align-intra-step-mask-mode',
         type=str,
@@ -580,6 +597,7 @@ if __name__ == '__main__':
     parser.add_argument('--scale', help='scale reward/return', type=int, default=1000)
     parser.add_argument('--model-dir', help='model weight dir for testing')
     parser.add_argument('--resume-checkpoint-dir', help='resume training from a saved checkpoint epoch directory')
+    parser.add_argument('--allow-partial-resume', action='store_true', help='allow missing/unexpected keys when resuming weights, useful for warm-starting a modified architecture from an older checkpoint')
     parser.add_argument('--device', action='store', dest='device', help='device (cuda or cpu) to run experiment')
     parser.add_argument('--device-out', action='store', dest='device_out', help='device (cuda or cpu) to place the split of model near the output')
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='device (cuda or cpu) to place the split of model between the input and output')
@@ -628,6 +646,8 @@ if __name__ == '__main__':
         assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
     if args.state_encoder_type == 'semantic_reprogram':
         assert args.reprogram_heads > 0, 'reprogram-heads should be positive'
+    if args.use_history_multiscale_mixer:
+        assert args.state_encoder_type == 'semantic_reprogram', 'use-history-multiscale-mixer requires state-encoder-type semantic_reprogram'
     if args.use_pre_align_intra_step_attn:
         assert args.state_encoder_type == 'semantic_reprogram', 'use-pre-align-intra-step-attn requires state-encoder-type semantic_reprogram'
         assert args.pre_align_intra_step_attn_heads > 0, 'pre-align-intra-step-attn-heads should be positive'
