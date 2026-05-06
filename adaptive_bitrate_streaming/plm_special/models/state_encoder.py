@@ -90,15 +90,18 @@ class NumericConditionalAttentionBlock(nn.Module):
 
 class ResidualFeatureGate(nn.Module):
     """
-    Zero-init scalar gate to inject new features conservatively.
+    Zero-init feature-wise gate to inject new features conservatively.
     """
 
-    def __init__(self, init_value=0.0):
+    def __init__(self, feature_dim, init_value=0.0):
         super().__init__()
-        self.gate = nn.Parameter(torch.tensor(float(init_value)))
+        if feature_dim < 1:
+            raise ValueError('feature_dim should be positive')
+        self.gate = nn.Parameter(torch.full((feature_dim,), float(init_value)))
 
     def forward(self, base, residual):
-        return base + torch.tanh(self.gate) * residual
+        gate = torch.tanh(self.gate).view(*([1] * (base.dim() - 1)), -1)
+        return base + gate * residual
 
 
 class MultiScaleHistoryMixer(nn.Module):
@@ -109,13 +112,16 @@ class MultiScaleHistoryMixer(nn.Module):
     all scales into one embedding.
     """
 
-    def __init__(self, input_length, embed_dim, dropout=0.1):
+    def __init__(self, input_length, embed_dim, dropout=0.1, max_scales=None):
         super().__init__()
         if input_length < 1:
             raise ValueError('input_length should be positive')
+        if max_scales is not None and max_scales < 1:
+            raise ValueError('max_scales should be positive when provided')
 
         self.input_length = input_length
         self.embed_dim = embed_dim
+        self.max_scales = max_scales
         self.scale_lengths = self._build_scale_lengths(input_length)
 
         self.bottom_up_mixers = nn.ModuleList([
@@ -150,7 +156,9 @@ class MultiScaleHistoryMixer(nn.Module):
 
     def _build_scale_lengths(self, input_length):
         scale_lengths = [input_length]
-        while scale_lengths[-1] > 1:
+        while scale_lengths[-1] > 1 and (
+            self.max_scales is None or len(scale_lengths) < self.max_scales
+        ):
             scale_lengths.append((scale_lengths[-1] + 1) // 2)
         return scale_lengths
 
@@ -472,18 +480,18 @@ class SemanticReprogrammingEncoder(nn.Module):
                 input_length=6,
                 embed_dim=numeric_embed_dim,
                 dropout=dropout,
+                max_scales=2,
             )
-            self.download_history_mixer = MultiScaleHistoryMixer(
-                input_length=6,
-                embed_dim=numeric_embed_dim,
-                dropout=dropout,
-            )
+            self.download_history_mixer = None
             if history_feature_dim == numeric_embed_dim:
                 self.history_mixer_output_proj = nn.Identity()
             else:
                 self.history_mixer_output_proj = nn.Linear(numeric_embed_dim, history_feature_dim)
-            self.throughput_history_gate = ResidualFeatureGate(init_value=0.0)
-            self.download_history_gate = ResidualFeatureGate(init_value=0.0)
+            self.throughput_history_gate = ResidualFeatureGate(
+                feature_dim=history_feature_dim,
+                init_value=0.0,
+            )
+            self.download_history_gate = None
         else:
             self.throughput_history_mixer = None
             self.download_history_mixer = None
@@ -652,20 +660,13 @@ class SemanticReprogrammingEncoder(nn.Module):
         if self.use_history_multiscale_mixer:
             flat_state = state.reshape(batch_size * seq_len, 6, 6)
             throughput_history = flat_state[:, 2:3, :]
-            download_history = flat_state[:, 3:4, :]
 
             mixed_throughput = self.throughput_history_mixer(throughput_history)
-            mixed_download = self.download_history_mixer(download_history)
             mixed_throughput = self.history_mixer_output_proj(mixed_throughput).reshape(batch_size, seq_len, -1)
-            mixed_download = self.history_mixer_output_proj(mixed_download).reshape(batch_size, seq_len, -1)
 
             feature_groups[2] = self.throughput_history_gate(
                 feature_groups[2],
                 mixed_throughput - feature_groups[2],
-            )
-            feature_groups[3] = self.download_history_gate(
-                feature_groups[3],
-                mixed_download - feature_groups[3],
             )
 
         numeric_tokens = torch.stack(list(feature_groups), dim=2)

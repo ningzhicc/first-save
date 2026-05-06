@@ -27,6 +27,7 @@ EVAL_PER_EPOCH=2
 GRAD_ACCUM_STEPS=32
 TARGET_RETURN_SCALE="1.0"
 SEED=100003
+EXP_TAG=""
 STATE_FEATURE_DIM=256
 PATCH_LEN=3
 PATCH_STRIDE=1
@@ -83,6 +84,7 @@ Options:
   --grad-accum-steps N
   --target-return-scale FLOAT
   --seed N
+  --exp-tag TAG
   --state-feature-dim N
   --patch-len N
   --patch-stride N
@@ -206,11 +208,19 @@ resolve_latest_best_model_dir() {
   local script_dir="$1"
   local search_root="${script_dir}/data/ft_plms/${PLM_TYPE}_${PLM_SIZE}"
   [[ -d "$search_root" ]] || die "Cannot find finetune directory: $search_root"
+  local exp_tag_filter="$2"
 
   local best_dir
   best_dir="$(
     find "$search_root" -type d -name 'early_stop_*_best_model' 2>/dev/null \
       | while IFS= read -r dir; do
+          if [[ -n "$exp_tag_filter" ]]; then
+            local parent_dir
+            parent_dir="$(basename "$(dirname "$dir")")"
+            if [[ "$parent_dir" != *"_${exp_tag_filter}" ]]; then
+              continue
+            fi
+          fi
           if [[ -f "$dir/modules_except_plm.bin" || -f "$dir/model.bin" ]]; then
             printf '%s\t%s\n' "$(stat -c '%Y' "$dir")" "$dir"
           fi
@@ -343,6 +353,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --seed)
       SEED="$2"
+      shift 2
+      ;;
+    --exp-tag)
+      EXP_TAG="$2"
       shift 2
       ;;
     --state-feature-dim)
@@ -513,6 +527,10 @@ COMMON_ARGS=(
   "--state-feature-dim" "$STATE_FEATURE_DIM"
 )
 
+if [[ -n "$EXP_TAG" ]]; then
+  COMMON_ARGS+=("--exp-tag" "$EXP_TAG")
+fi
+
 if [[ -n "$RESOLVED_PLM_PATH" ]]; then
   COMMON_ARGS+=("--plm-path" "$RESOLVED_PLM_PATH")
 fi
@@ -609,7 +627,7 @@ fi
 
 if [[ "$MODE" == "test" || "$MODE" == "both" ]]; then
   if [[ -z "$RESOLVED_MODEL_DIR" ]]; then
-    RESOLVED_MODEL_DIR="$(resolve_latest_best_model_dir "$SCRIPT_DIR")"
+    RESOLVED_MODEL_DIR="$(resolve_latest_best_model_dir "$SCRIPT_DIR" "$EXP_TAG")"
   fi
   [[ -d "$RESOLVED_MODEL_DIR" ]] || die "Model directory not found: $RESOLVED_MODEL_DIR"
 

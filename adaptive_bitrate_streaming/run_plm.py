@@ -124,6 +124,11 @@ def _build_run_tag(args):
         f'e{args.num_epochs}',
         f's{args.seed}',
     ])
+    if args.exp_tag is not None:
+        sanitized_exp_tag = args.exp_tag.strip().replace(' ', '-')
+        if len(sanitized_exp_tag) == 0:
+            raise ValueError('exp-tag should not be empty when provided')
+        run_tag_parts.append(sanitized_exp_tag)
     run_tag = '_'.join(run_tag_parts)
     return encoder_tag, run_tag
 
@@ -595,6 +600,7 @@ if __name__ == '__main__':
     parser.add_argument('--grad-accum-steps', dest='grad_accum_steps', type=int, default=32)
     parser.add_argument('--seed', help='random seed', type=int, default=100003)
     parser.add_argument('--scale', help='scale reward/return', type=int, default=1000)
+    parser.add_argument('--exp-tag', help='optional experiment suffix appended to output/result directory names')
     parser.add_argument('--model-dir', help='model weight dir for testing')
     parser.add_argument('--resume-checkpoint-dir', help='resume training from a saved checkpoint epoch directory')
     parser.add_argument('--allow-partial-resume', action='store_true', help='allow missing/unexpected keys when resuming weights, useful for warm-starting a modified architecture from an older checkpoint')
