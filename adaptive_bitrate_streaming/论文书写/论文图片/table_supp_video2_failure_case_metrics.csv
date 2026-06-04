@@ -1,0 +1,2 @@
+trace,trace_key,genet_reward,final_reward,reward_gain,genet_bitrate,final_bitrate,genet_rebuf,final_rebuf,genet_smooth,final_smooth
+result_sim_abr_fcc-test_074_test_fcc_trace_27175_http---www.amazon.com_1140_0,074_test_fcc_trace_27175_http---www.amazon.com_1140_0,0.06049102829050377,-4.506495694849284,-4.566986723139788,2023.9583333333333,2188.5416666666665,0.42832973532553353,1.4893683786761633,0.15729166666666666,0.23125000000000004

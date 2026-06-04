@@ -12,6 +12,7 @@ DEVICE="cuda:0"
 EXP_POOL_PATH="artifacts/exp_pools/exp_pool.pkl"
 MODEL_DIR=""
 RESUME_CHECKPOINT_DIR=""
+ALLOW_PARTIAL_RESUME=0
 TRACE_NAME="fcc-test"
 TRACE_NUM=100
 VIDEO_NAME="video1"
@@ -26,6 +27,7 @@ EVAL_PER_EPOCH=2
 GRAD_ACCUM_STEPS=32
 TARGET_RETURN_SCALE="1.0"
 SEED=100003
+EXP_TAG=""
 STATE_FEATURE_DIM=256
 PATCH_LEN=3
 PATCH_STRIDE=1
@@ -39,6 +41,7 @@ PRE_ALIGN_INTRA_STEP_ATTN_HIDDEN_DIM=1024
 PRE_ALIGN_INTRA_STEP_ATTN_DROPOUT="0.1"
 USE_PRE_ALIGN_INTRA_STEP_MASK=0
 PRE_ALIGN_INTRA_STEP_MASK_MODE="context_readonly"
+USE_HISTORY_MULTISCALE_MIXER=0
 USE_INTRA_STATE_ATTN=0
 USE_GATED_INTRA_STATE_ATTN=0
 INTRA_STATE_ATTN_HEADS=4
@@ -66,6 +69,7 @@ Options:
   --exp-pool-path PATH
   --model-dir PATH
   --resume-checkpoint-dir PATH
+  --allow-partial-resume
   --trace NAME
   --trace-num N
   --video NAME
@@ -80,6 +84,7 @@ Options:
   --grad-accum-steps N
   --target-return-scale FLOAT
   --seed N
+  --exp-tag TAG
   --state-feature-dim N
   --patch-len N
   --patch-stride N
@@ -93,6 +98,7 @@ Options:
   --pre-align-intra-step-attn-dropout FLOAT
   --use-pre-align-intra-step-mask
   --pre-align-intra-step-mask-mode {context_readonly|state_to_prev_action|state_to_prev_reward|state_only}
+  --use-history-multiscale-mixer
   --use-intra-state-attn
   --use-gated-intra-state-attn
   --intra-state-attn-heads N
@@ -112,12 +118,14 @@ Examples:
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-conditional-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask --pre-align-intra-step-mask-mode state_to_prev_action
+  ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-pre-align-intra-step-attn --use-pre-align-intra-step-mask --pre-align-intra-step-mask-mode state_to_prev_reward --use-history-multiscale-mixer
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-intra-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-gated-intra-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn
   ./run_qwen.sh --mode adapt --state-encoder-type semantic_reprogram --use-temporal-state-attn --use-temporal-causal-mask
   ./run_qwen.sh --mode test --model-dir data/ft_plms/qwen_base/.../early_stop_-1_best_model
   ./run_qwen.sh --mode adapt --num-epochs 60 --resume-checkpoint-dir data/ft_plms/llama_small/.../early_stop_-1_checkpoint/38
+  ./run_qwen.sh --mode adapt --resume-checkpoint-dir data/ft_plms/llama_small/.../early_stop_-1_checkpoint/59 --allow-partial-resume --state-encoder-type semantic_reprogram --use-history-multiscale-mixer
   ./run_qwen.sh --plm-type llama --plm-size small --plm-path ../downloaded_plms/llama3.2/base --mode both
   ./run_qwen.sh --mode adapt -- --which-layer 8
 EOF
@@ -200,11 +208,19 @@ resolve_latest_best_model_dir() {
   local script_dir="$1"
   local search_root="${script_dir}/data/ft_plms/${PLM_TYPE}_${PLM_SIZE}"
   [[ -d "$search_root" ]] || die "Cannot find finetune directory: $search_root"
+  local exp_tag_filter="$2"
 
   local best_dir
   best_dir="$(
     find "$search_root" -type d -name 'early_stop_*_best_model' 2>/dev/null \
       | while IFS= read -r dir; do
+          if [[ -n "$exp_tag_filter" ]]; then
+            local parent_dir
+            parent_dir="$(basename "$(dirname "$dir")")"
+            if [[ "$parent_dir" != *"_${exp_tag_filter}" ]]; then
+              continue
+            fi
+          fi
           if [[ -f "$dir/modules_except_plm.bin" || -f "$dir/model.bin" ]]; then
             printf '%s\t%s\n' "$(stat -c '%Y' "$dir")" "$dir"
           fi
@@ -279,6 +295,10 @@ while [[ $# -gt 0 ]]; do
       RESUME_CHECKPOINT_DIR="$2"
       shift 2
       ;;
+    --allow-partial-resume)
+      ALLOW_PARTIAL_RESUME=1
+      shift
+      ;;
     --trace)
       TRACE_NAME="$2"
       shift 2
@@ -335,6 +355,10 @@ while [[ $# -gt 0 ]]; do
       SEED="$2"
       shift 2
       ;;
+    --exp-tag)
+      EXP_TAG="$2"
+      shift 2
+      ;;
     --state-feature-dim)
       STATE_FEATURE_DIM="$2"
       shift 2
@@ -386,6 +410,10 @@ while [[ $# -gt 0 ]]; do
     --pre-align-intra-step-mask-mode)
       PRE_ALIGN_INTRA_STEP_MASK_MODE="$2"
       shift 2
+      ;;
+    --use-history-multiscale-mixer)
+      USE_HISTORY_MULTISCALE_MIXER=1
+      shift
       ;;
     --use-intra-state-attn)
       USE_INTRA_STATE_ATTN=1
@@ -499,6 +527,10 @@ COMMON_ARGS=(
   "--state-feature-dim" "$STATE_FEATURE_DIM"
 )
 
+if [[ -n "$EXP_TAG" ]]; then
+  COMMON_ARGS+=("--exp-tag" "$EXP_TAG")
+fi
+
 if [[ -n "$RESOLVED_PLM_PATH" ]]; then
   COMMON_ARGS+=("--plm-path" "$RESOLVED_PLM_PATH")
 fi
@@ -547,6 +579,9 @@ elif [[ "$STATE_ENCODER_TYPE" == "semantic_reprogram" ]]; then
     "--reprogram-heads" "$REPROGRAM_HEADS"
     "--reprogram-dropout" "$REPROGRAM_DROPOUT"
   )
+  if [[ "$USE_HISTORY_MULTISCALE_MIXER" -eq 1 ]]; then
+    COMMON_ARGS+=("--use-history-multiscale-mixer")
+  fi
   if [[ "$USE_PRE_ALIGN_INTRA_STEP_ATTN" -eq 1 ]]; then
     COMMON_ARGS+=(
       "--use-pre-align-intra-step-attn"
@@ -581,6 +616,9 @@ if [[ "$MODE" == "adapt" || "$MODE" == "both" ]]; then
   if [[ -n "$RESOLVED_RESUME_CHECKPOINT_DIR" ]]; then
     ADAPT_ARGS+=("--resume-checkpoint-dir" "$RESOLVED_RESUME_CHECKPOINT_DIR")
   fi
+  if [[ "$ALLOW_PARTIAL_RESUME" -eq 1 ]]; then
+    ADAPT_ARGS+=("--allow-partial-resume")
+  fi
   if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
     ADAPT_ARGS+=("${EXTRA_ARGS[@]}")
   fi
@@ -589,7 +627,7 @@ fi
 
 if [[ "$MODE" == "test" || "$MODE" == "both" ]]; then
   if [[ -z "$RESOLVED_MODEL_DIR" ]]; then
-    RESOLVED_MODEL_DIR="$(resolve_latest_best_model_dir "$SCRIPT_DIR")"
+    RESOLVED_MODEL_DIR="$(resolve_latest_best_model_dir "$SCRIPT_DIR" "$EXP_TAG")"
   fi
   [[ -d "$RESOLVED_MODEL_DIR" ]] || die "Model directory not found: $RESOLVED_MODEL_DIR"
 

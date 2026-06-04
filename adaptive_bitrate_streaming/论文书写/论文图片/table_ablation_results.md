@@ -1,0 +1,6 @@
+| Method                                         | Category   |   Seeds | Mean reward       | Bitrate         | Rebuffering       | Smoothness        |
+|:-----------------------------------------------|:-----------|--------:|:------------------|:----------------|:------------------|:------------------|
+| Semantic reprogramming baseline                | This work  |       5 | 0.8068 +/- 0.0804 | 1030.4 +/- 69.7 | 0.0765 +/- 0.0210 | 0.0764 +/- 0.0062 |
+| Context pre-alignment enhanced model           | This work  |       5 | 0.8547 +/- 0.1000 | 1015.8 +/- 26.7 | 0.0627 +/- 0.0225 | 0.0746 +/- 0.0101 |
+| Original multi-scale history mixer             | This work  |       5 | 0.8695 +/- 0.0492 | 1046.6 +/- 42.8 | 0.0636 +/- 0.0152 | 0.0870 +/- 0.0260 |
+| Lightweight multi-scale history enhanced model | This work  |       5 | 0.8967 +/- 0.0475 | 1057.0 +/- 33.7 | 0.0610 +/- 0.0114 | 0.0821 +/- 0.0241 |

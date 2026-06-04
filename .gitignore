@@ -1,8 +1,11 @@
 __pycache__
 .idea
 .vscode
+.local_env/
 
 results
+!adaptive_bitrate_streaming/artifacts/results/
+!adaptive_bitrate_streaming/artifacts/results/**
 
 downloaded_plms
 ft_plms

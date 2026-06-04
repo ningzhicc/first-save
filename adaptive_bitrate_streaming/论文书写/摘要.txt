@@ -1,0 +1,18 @@
+摘要
+
+    随着在线视频业务规模扩大，动态网络环境下的视频传输需要根据带宽、缓冲区状态和内容实时选择合适码率，以提升用户体验质量。传统自适应码率算法通常依赖固定规则或专用强化学习模型，在网络分布变化下存在泛化能力不足、模型设计成本较高等问题。针对上述问题，本文基于 NetLLM 与自适应码率视频传输仿真框架，设计并实现了一种基于大语言模型适配的自适应码率决策方法。
+
+    本文构建 ABR 实验流程，包括网络轨迹加载、经验池生成、离线训练、在线验证与测试；采用语义重编程方法，将码率、缓冲区、历史吞吐量、下载时延、视频块大小和剩余视频长度等数值状态映射到大语言模型表征空间；进一步引入结合历史动作与历史奖励的步内预对齐机制，并设计轻量化历史多尺度建模模块，以增强模型对短期带宽变化趋势和决策上下文的理解能力。实验在 FCC 网络轨迹和固定视频数据集上进行，评价指标包括平均奖励、平均码率、重缓冲时间和平滑性惩罚。结果表明，本文的轻量化多尺度历史增强模型在 5 个随机种子下的平均奖励达到 0.8967，高于 BBA 规则算法、MPC 预测控制算法及 UDR、Genet 强化学习基线，相较 Genet 的 0.8587 有提升，验证了方法有效性。
+
+关键词：自适应码率；大语言模型；语义重编程；体验质量；视频传输
+
+
+Research and Implementation of Adaptive Bitrate Video Streaming Decision Method Based on Large Language Model Adaptation
+
+Abstract
+
+    With the rapid growth of online video services, video streaming in dynamic network environments needs to select appropriate bitrates according to bandwidth, buffer status, and video content, so as to improve quality of experience. Traditional adaptive bitrate algorithms usually rely on fixed rules or task-specific reinforcement learning models, which may suffer from limited generalization ability and high model design cost under changing network distributions. To address these problems, this thesis designs and implements an adaptive bitrate decision method based on large language model adaptation within the NetLLM and ABR simulation framework.
+
+    This thesis builds an ABR experimental workflow, including network trace loading, experience pool generation, offline training, online validation, and test evaluation. Semantic reprogramming is adopted to map numerical ABR states, including bitrate, buffer size, throughput history, download delay, chunk size, and remaining video length, into the representation space of a large language model. An intra-step pre-alignment mechanism with previous actions and previous rewards is introduced, and a lightweight multi-scale history modeling module is designed to improve the model's understanding of short-term bandwidth trends and decision context. Experiments are conducted on FCC network traces and a fixed video dataset. The evaluation metrics include mean reward, average bitrate, rebuffering time, and smoothness penalty. Results show that the proposed lightweight multi-scale history-enhanced model achieves a mean reward of 0.8967 over five random seeds, outperforming the BBA rule-based algorithm, the MPC predictive control algorithm, and the UDR and Genet reinforcement learning baselines. Compared with Genet's mean reward of 0.8587, the proposed method obtains a clear improvement, which verifies its effectiveness.
+
+Key Words: Adaptive bitrate; Large language model; Semantic reprogramming; Quality of experience; Video streaming
